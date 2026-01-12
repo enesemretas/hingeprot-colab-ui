@@ -19,7 +19,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     READ_PY   = os.path.join(HINGEPROT_DIR, "read.py")
     GNM_PY    = os.path.join(HINGEPROT_DIR, "gnm.py")
     ANM2_PY   = os.path.join(HINGEPROT_DIR, "anm2.py")
-    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")  # auto-k, sigma=eps internally
+    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")  # k=38, sigma=eps internally
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -539,7 +539,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
 
             # Steps:
-            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig (useblz auto-k), 7 finalize
+            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig (useblz: k=38, sigma=eps), 7 finalize
             progress.max = 7
             progress.value = 0
             progress.bar_style = "info"
@@ -614,13 +614,16 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             progress.value += 1  # anm2 done
 
-            # ---- ANM sparse eigen solve via useblz.py (AUTO-K, sigma=machine eps internally) ----
+            # ---- ANM sparse eigen solve via useblz.py (k=38, sigma=machine eps internally) ----
             upper_path = os.path.join(state["run_dir"], "upperhessian")
             if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
                 raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
 
-            _show_log("Solving eigenproblem with useblz.py (auto-k, sigma=machine epsilon)...")
-            cmd4 = ["python3", USEBLZ_PY, "upperhessian"]
+            # Force output name that your pipeline expects
+            out_name = "upperhessian.vwmatrix"
+
+            _show_log("Solving eigenproblem with useblz.py (k=38, sigma=machine epsilon)...")
+            cmd4 = ["python3", USEBLZ_PY, "upperhessian", "--out", out_name]
             _show_log(f"Running: {' '.join(cmd4)}")
             proc4 = subprocess.run(cmd4, cwd=state["run_dir"], capture_output=True, text=True)
 
@@ -631,9 +634,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if proc4.returncode != 0:
                 raise RuntimeError(f"useblz.py failed (return code {proc4.returncode}).")
 
-            out_vw = os.path.join(state["run_dir"], "upperhessian.vwmatrix")
+            out_vw = os.path.join(state["run_dir"], out_name)
             if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
-                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrix (missing/empty).")
+                raise RuntimeError(f"useblz.py did not produce {out_name} (missing/empty).")
 
             progress.value += 1
             _show_log(f"Eigen solve done. Wrote: {out_vw}")
