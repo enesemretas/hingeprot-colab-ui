@@ -1,7 +1,7 @@
 # ui.py
 from __future__ import annotations
 
-import os, re, subprocess, datetime, base64, uuid
+import os, re, subprocess, datetime, base64, uuid, shutil
 import requests
 import ipywidgets as W
 from IPython.display import display, clear_output
@@ -20,14 +20,20 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     GNM_PY    = os.path.join(HINGEPROT_DIR, "gnm.py")
     ANM2_PY   = os.path.join(HINGEPROT_DIR, "anm2.py")
 
-    # Compiled Fortran executable "useblz" (preferred)
-    # Put the binary named "useblz" in the same folder as ui.py,
-    # or set env var HINGEPROT_USEBLZ_EXE to its full path.
-    USEBLZ_EXE = os.environ.get("HINGEPROT_USEBLZ_EXE", os.path.join(HINGEPROT_DIR, "useblz"))
+    # Compiled Fortran executable "useblz"
+    # Option 1: set env var HINGEPROT_USEBLZ_EXE to full path
+    # Option 2: place binary in same folder as ui.py with name useblz/useblz.x/useblz.out/useblz.exe
+    ENV_USEBLZ = os.environ.get("HINGEPROT_USEBLZ_EXE", "").strip()
 
     os.makedirs(runs_root, exist_ok=True)
 
     # ---------- helpers ----------
+    def _show_cmd_output(tag: str, proc: subprocess.CompletedProcess):
+        if proc.stdout and proc.stdout.strip():
+            _show_log(f"[{tag} stdout]\n{proc.stdout.rstrip()}")
+        if proc.stderr and proc.stderr.strip():
+            _show_log(f"[{tag} stderr]\n{proc.stderr.rstrip()}")
+
     def _fetch_pdb(pdb_code: str, out_path: str):
         code = pdb_code.strip().upper()
         if not re.fullmatch(r"[0-9A-Z]{4}", code):
@@ -60,15 +66,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         keep_ter: bool = True,
         keep_only_first_model: bool = True,
     ) -> dict:
-        """
-        Preprocess (MATLAB logic adapted to raw PDB text):
-
-        - Keep ONLY first MODEL block (if present) else all.
-        - Keep only ATOM (and optionally TER). Drop HETATM and everything else.
-        - altLoc: keep if blank or 'A'
-        - iCode : keep if blank
-        - chain : keep only selected chains (if chains_keep is not None)
-        """
         stats = {
             "lines_read": 0,
             "lines_written": 0,
@@ -93,7 +90,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 stats["lines_read"] += 1
                 rec = line[:6]
 
-                # MODEL logic: keep only first MODEL block (if present)
                 if keep_only_first_model:
                     if rec == "MODEL ":
                         if not model_found:
@@ -114,16 +110,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     if model_done:
                         continue
 
-                    # If MODEL exists, ignore anything outside the first MODEL
                     if model_found and not in_model:
                         continue
 
-                # Drop HETATM
                 if rec == "HETATM":
                     stats["hetatm_skipped"] += 1
                     continue
 
-                # TER optional
                 if rec == "TER   ":
                     if not keep_ter:
                         stats["nonatom_skipped"] += 1
@@ -138,12 +131,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     stats["ter_written"] += 1
                     continue
 
-                # Keep only ATOM
                 if rec != "ATOM  ":
                     stats["nonatom_skipped"] += 1
                     continue
 
-                # chain filter
                 if chains_keep is not None:
                     if len(line) <= 21:
                         stats["chain_skipped"] += 1
@@ -153,13 +144,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         stats["chain_skipped"] += 1
                         continue
 
-                # altLoc filter (col 17 => index 16)
                 altloc = line[16] if len(line) > 16 else " "
                 if altloc not in (" ", "A"):
                     stats["altloc_skipped"] += 1
                     continue
 
-                # iCode filter (col 27 => index 26)
                 icode = line[26] if len(line) > 26 else " "
                 if icode != " ":
                     stats["icode_skipped"] += 1
@@ -206,24 +195,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     css = W.HTML(r"""
     <style>
     .hp-card {border:1px solid #e5e7eb; border-radius:14px; padding:14px 16px; margin:10px 0; background:#fff;}
-    .hp-small {font-size:12px; color:#6b7280; margin-top:6px;}
-
     .hp-banner{
-      border:1px solid #e5e7eb;
-      border-radius:16px;
-      padding:14px 18px;
-      margin:10px 0 12px 0;
-      background:#fff;
-      display:flex;
-      align-items:center;
-      gap:16px;
-      box-shadow: 0 1px 0 rgba(0,0,0,0.03);
+      border:1px solid #e5e7eb; border-radius:16px; padding:14px 18px; margin:10px 0 12px 0;
+      background:#fff; display:flex; align-items:center; gap:16px; box-shadow: 0 1px 0 rgba(0,0,0,0.03);
     }
     .hp-dot{ width:14px; height:14px; background:#ef4444; border-radius:999px; }
-    .hp-title{
-      font-size:34px; font-weight:900; letter-spacing:0.5px; line-height:1.0; margin:0;
-      color:#111827; font-family: Arial, Helvetica, sans-serif;
-    }
+    .hp-title{ font-size:34px; font-weight:900; letter-spacing:0.5px; line-height:1.0; margin:0;
+      color:#111827; font-family: Arial, Helvetica, sans-serif; }
     .hp-title .prot{ color:#ef4444; }
     .hp-underline{ height:3px; width:280px; background:#111827; margin-top:6px; border-radius:999px; opacity:0.9; }
     .hp-tagline{ margin-top:6px; font-size:16px; font-weight:800; color:#dc2626; font-family: Arial, Helvetica, sans-serif; }
@@ -313,8 +291,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         "upload_name": None,
         "upload_bytes": None,
         "detected_chains": [],
-        "chain_cbs": {},          # dict[str, Checkbox]
-        "manual_selection": (),   # last non-all selection
+        "chain_cbs": {},
+        "manual_selection": (),
         "_syncing": False,
     }
 
@@ -393,7 +371,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     def _set_selection(sel: list[str]):
         detected = state.get("detected_chains", [])
         sel = [c for c in sel if c in detected]
-
         state["_syncing"] = True
         try:
             for ch, cb in state["chain_cbs"].items():
@@ -460,11 +437,48 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     all_chains.observe(_on_all_chains_toggle, names="value")
 
+    def _find_useblz_exe() -> str | None:
+        candidates = []
+        if ENV_USEBLZ:
+            candidates.append(ENV_USEBLZ)
+
+        # common names next to ui.py
+        for nm in ("useblz", "useblz.x", "useblz.out", "useblz.exe"):
+            candidates.append(os.path.join(HINGEPROT_DIR, nm))
+
+        # also allow a bin folder
+        for nm in ("useblz", "useblz.x", "useblz.out", "useblz.exe"):
+            candidates.append(os.path.join(HINGEPROT_DIR, "bin", nm))
+
+        for p in candidates:
+            if p and os.path.exists(p) and os.path.isfile(p):
+                return p
+        return None
+
+    def _diagnose_exe(path: str):
+        _show_log(f"Diagnose executable: {path}")
+        try:
+            proc = subprocess.run(["bash", "-lc", f"ls -lah '{path}' && file '{path}'"], capture_output=True, text=True)
+            _show_cmd_output("file", proc)
+        except Exception as e:
+            _show_log(f"Could not run file/ls diagnostics: {e}")
+
+        try:
+            proc = subprocess.run(["bash", "-lc", f"ldd '{path}' || true"], capture_output=True, text=True)
+            _show_cmd_output("ldd", proc)
+        except Exception as e:
+            _show_log(f"Could not run ldd diagnostics: {e}")
+
+        try:
+            proc = subprocess.run(["bash", "-lc", "uname -m"], capture_output=True, text=True)
+            _show_cmd_output("uname", proc)
+        except Exception:
+            pass
+
     # ---------- actions ----------
     def on_load_clicked(_):
         with log_out:
             clear_output()
-
         try:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             run_dir = os.path.join(runs_root, f"run_{ts}")
@@ -516,16 +530,21 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         try:
             if not state["pdb_path"] or not os.path.exists(state["pdb_path"]):
                 raise RuntimeError("Please click 'Load / Detect Chains' first.")
-            if not os.path.exists(READ_PY):
-                raise RuntimeError(f"read.py not found at: {READ_PY}")
-            if not os.path.exists(GNM_PY):
-                raise RuntimeError(f"gnm.py not found at: {GNM_PY}")
-            if not os.path.exists(ANM2_PY):
-                raise RuntimeError(f"anm2.py not found at: {ANM2_PY}")
-            if not os.path.exists(USEBLZ_EXE):
+            for p in (READ_PY, GNM_PY, ANM2_PY):
+                if not os.path.exists(p):
+                    raise RuntimeError(f"Missing required script: {p}")
+
+            useblz_exe = _find_useblz_exe()
+            if not useblz_exe:
+                _show_log("Compiled useblz not found. Listing hingeprot directory:")
+                try:
+                    proc = subprocess.run(["bash", "-lc", f"ls -lah '{HINGEPROT_DIR}'"], capture_output=True, text=True)
+                    _show_cmd_output("ls hingeprot", proc)
+                except Exception:
+                    pass
                 raise RuntimeError(
-                    f"Compiled useblz executable not found at: {USEBLZ_EXE}\n"
-                    f"Place 'useblz' next to ui.py or set env var HINGEPROT_USEBLZ_EXE to its full path."
+                    "Place compiled binary as 'useblz' (or useblz.x/useblz.out/useblz.exe) next to ui.py,\n"
+                    "or set env var HINGEPROT_USEBLZ_EXE to its full path."
                 )
 
             detected = state.get("detected_chains", [])
@@ -545,8 +564,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             gnm_val = float(get_gnm_cut())
             anm_val = float(get_anm_cut())
 
-            # Steps:
-            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig (useblz exe), 7 finalize
             progress.max = 7
             progress.value = 0
             progress.bar_style = "info"
@@ -579,80 +596,51 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not os.path.exists(pdb_out) or os.path.getsize(pdb_out) == 0:
                 raise RuntimeError("Preprocess produced empty 'pdb'. Check chain selection / filters.")
 
-            # ---- run read.py -> produces alpha.cor + coordinates ----
             cmd = ["python3", READ_PY, "pdb", "alpha.cor", "coordinates"]
             _show_log(f"Running: {' '.join(cmd)}")
             proc = subprocess.run(cmd, cwd=state["run_dir"], capture_output=True, text=True)
-
-            if proc.stdout.strip():
-                _show_log(proc.stdout.rstrip())
-            if proc.stderr.strip():
-                _show_log(proc.stderr.rstrip())
+            _show_cmd_output("read.py", proc)
             if proc.returncode != 0:
                 raise RuntimeError(f"read.py failed (return code {proc.returncode}).")
+            progress.value += 1
 
-            progress.value += 1  # read.py done
-
-            # ---- run gnm.py -> uses coordinates + gnmcutoff ----
             cmd2 = ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"]
             _show_log(f"Running: {' '.join(cmd2)}")
             proc2 = subprocess.run(cmd2, cwd=state["run_dir"], capture_output=True, text=True)
-
-            if proc2.stdout.strip():
-                _show_log(proc2.stdout.rstrip())
-            if proc2.stderr.strip():
-                _show_log(proc2.stderr.rstrip())
+            _show_cmd_output("gnm.py", proc2)
             if proc2.returncode != 0:
                 raise RuntimeError(f"gnm.py failed (return code {proc2.returncode}).")
+            progress.value += 1
 
-            progress.value += 1  # gnm done
-
-            # ---- run anm2.py -> uses alpha.cor + anmcutoff ----
             cmd3 = ["python3", ANM2_PY, "--alpha", "alpha.cor", "--cutoff", "anmcutoff", "--out", "upperhessian"]
             _show_log(f"Running: {' '.join(cmd3)}")
             proc3 = subprocess.run(cmd3, cwd=state["run_dir"], capture_output=True, text=True)
-
-            if proc3.stdout.strip():
-                _show_log(proc3.stdout.rstrip())
-            if proc3.stderr.strip():
-                _show_log(proc3.stderr.rstrip())
+            _show_cmd_output("anm2.py", proc3)
             if proc3.returncode != 0:
                 raise RuntimeError(f"anm2.py failed (return code {proc3.returncode}).")
+            progress.value += 1
 
-            progress.value += 1  # anm2 done
-
-            # ---- ANM sparse eigen solve via compiled useblz executable ----
             upper_path = os.path.join(state["run_dir"], "upperhessian")
             if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
                 raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
 
-            # Output MUST be a .vwmatrix
             out_name = "upperhessian.vwmatrix"
             out_vw = os.path.join(state["run_dir"], out_name)
 
-            # Ensure executable bit (safe no-op if already set)
+            # Copy executable into run_dir and run it from there (avoids path/permission surprises)
+            local_exe = os.path.join(state["run_dir"], "useblz")
+            shutil.copy2(useblz_exe, local_exe)
+            subprocess.run(["chmod", "+x", local_exe], cwd=state["run_dir"], capture_output=True, text=True)
+
+            _show_log("Solving eigenproblem with compiled useblz executable...")
             try:
-                subprocess.run(["chmod", "+x", USEBLZ_EXE], check=False, capture_output=True, text=True)
-            except Exception:
-                pass
-
-            def _run_useblz_exec():
-                """
-                Compiled useblz binaries differ:
-                  - some run with no args and assume fixed filenames in cwd
-                  - some accept: useblz <matrixfile>
-                  - some accept: useblz <matrixfile> <outfile>
-                We'll try a few common patterns.
-                """
                 attempts = [
-                    [USEBLZ_EXE, "upperhessian", out_name],
-                    [USEBLZ_EXE, "upperhessian"],
-                    [USEBLZ_EXE],
+                    [local_exe, "upperhessian", out_name],
+                    [local_exe, "upperhessian"],
+                    [local_exe],
                 ]
-
                 last = None
                 for cmd_try in attempts:
-                    # clean old output between attempts to avoid false positives
                     try:
                         if os.path.exists(out_vw):
                             os.remove(out_vw)
@@ -660,34 +648,29 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         pass
 
                     _show_log(f"Running: {' '.join(cmd_try)}")
-                    proc4 = subprocess.run(cmd_try, cwd=state["run_dir"], capture_output=True, text=True)
-                    last = proc4
+                    last = subprocess.run(cmd_try, cwd=state["run_dir"], capture_output=True, text=True)
+                    _show_cmd_output("useblz", last)
 
-                    if proc4.stdout.strip():
-                        _show_log(proc4.stdout.rstrip())
-                    if proc4.stderr.strip():
-                        _show_log(proc4.stderr.rstrip())
+                    if last.returncode == 0 and os.path.exists(out_vw) and os.path.getsize(out_vw) > 0:
+                        break
 
-                    if os.path.exists(out_vw) and os.path.getsize(out_vw) > 0 and proc4.returncode == 0:
-                        return
+                if not (os.path.exists(out_vw) and os.path.getsize(out_vw) > 0):
+                    rc = last.returncode if last is not None else "?"
+                    raise RuntimeError(f"useblz did not produce {out_name}. Last return code: {rc}")
 
-                rc = last.returncode if last is not None else "?"
+            except FileNotFoundError as e:
+                # This is the "it exists but still Errno 2" case: missing loader / wrong arch / bad shebang
+                _show_log(f"ERROR when launching useblz: {e}")
+                _diagnose_exe(local_exe)
                 raise RuntimeError(
-                    f"Compiled useblz failed to produce {out_name}.\n"
-                    f"Last return code: {rc}\n"
-                    f"Make sure the executable expects 'upperhessian' in cwd, or adjust the invocation."
+                    "useblz exists but cannot be executed in this Colab runtime.\n"
+                    "Most likely: wrong architecture or missing dynamic loader (musl/ARM/etc.).\n"
+                    "See the diagnostics above (file/ldd)."
                 )
-
-            _show_log("Solving eigenproblem with compiled useblz executable...")
-            _run_useblz_exec()
-
-            if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
-                raise RuntimeError(f"useblz did not produce {out_name} (missing/empty).")
 
             progress.value += 1
             _show_log(f"Eigen solve done. Wrote: {out_vw}")
 
-            # ---- finalize ----
             progress.value = progress.max
             progress.bar_style = "success"
 
