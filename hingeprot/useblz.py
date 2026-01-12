@@ -13,7 +13,7 @@ Output (default): <input>.vwmatrix
   then:  eigenvectors, written in Fortran column-major order (all of v1, then v2, ...),
          5 numbers per line.
 
-Formatting rules (per user request):
+Formatting rules:
   1) Header line starts with exactly one space.
   2) Other lines start with one leading space if first number is negative,
      otherwise two leading spaces.
@@ -22,7 +22,10 @@ Formatting rules (per user request):
        - else -> 2 spaces before it
   4) Numbers use 9 significant figures in fixed format until 0.0001; below that -> scientific,
      with mantissa having 8 decimals and an 'E' exponent (e.g., -3.30213541E-07).
-  5) Eigenvector columns 3,4,5 (1-indexed) are sign-flipped globally.
+
+Eigenvector signs are NOT modified.
+
+Default sigma is fixed to machine epsilon: 2.22044605E-16.
 
 Usage:
   python3 useblz.py upperhessian
@@ -36,6 +39,9 @@ import math
 from typing import Optional, Tuple
 
 import numpy as np
+
+MACHINE_EPS_STR = "2.22044605E-16"
+MACHINE_EPS = float(MACHINE_EPS_STR)
 
 
 def read_upper_tri_coo(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
@@ -110,10 +116,9 @@ def auto_k(n: int, desired_nonzero_modes: int = 35) -> int:
     return max(1, k)
 
 
-def auto_sigma(start_sigma: float = 1e-6) -> float:
-    """Auto-select sigma (shift)."""
-    sig = float(start_sigma)
-    return 1e-6 if sig == 0.0 else sig
+def auto_sigma() -> float:
+    """Fixed sigma = machine epsilon as requested."""
+    return MACHINE_EPS
 
 
 def format_9sig(x: float) -> str:
@@ -144,10 +149,11 @@ def format_9sig(x: float) -> str:
 def format_line(nums: list[float], header: bool = False) -> str:
     """Apply spacing rules to a list of numbers."""
     if header:
+        # exactly one leading space; then "k n"
         return " " + " ".join(str(int(v)) for v in nums)
 
     out = []
-    for idx, v in enumerate(nums):
+    for v in nums:
         s = format_9sig(float(v))
         # leading/separator spaces are sign-dependent
         out.append((" " if v < 0 else "  ") + s)
@@ -160,7 +166,6 @@ def solve_upperhessian_to_vwmatrix(
     k: Optional[int] = None,
     sigma: Optional[float] = None,
     desired_nonzero_modes: int = 35,
-    flip_mode_columns_3_to_5: bool = True,
 ) -> str:
     """Compute eigenpairs near sigma and write .vwmatrix."""
     from scipy.sparse import eye
@@ -171,19 +176,23 @@ def solve_upperhessian_to_vwmatrix(
     A_csc = A.tocsc()
 
     k_eff = auto_k(n, desired_nonzero_modes) if (k is None or k <= 0) else int(k)
-    sig = auto_sigma(1e-6) if (sigma is None) else float(sigma)
+    sig = auto_sigma() if (sigma is None) else float(sigma)
+    if sig == 0.0:
+        sig = auto_sigma()
 
     # Robust factorization: if sigma too close to an eigenvalue, nudge it
     lu = None
     last_err = None
-    for _ in range(8):
+    sig_try = sig
+    for _ in range(10):
         try:
-            Ashift = (A_csc - sig * eye(n, format="csc", dtype=np.float64))
+            Ashift = (A_csc - sig_try * eye(n, format="csc", dtype=np.float64))
             lu = splu(Ashift)
+            sig = sig_try
             break
         except Exception as e:
             last_err = e
-            sig *= 10.0
+            sig_try *= 10.0
     if lu is None:
         raise RuntimeError(f"Factorization failed; last error: {last_err}")
 
@@ -205,10 +214,6 @@ def solve_upperhessian_to_vwmatrix(
     order = np.argsort(evals)
     evals = np.asarray(evals[order], dtype=np.float64)
     evecs = np.asarray(evecs[:, order], dtype=np.float64)
-
-    # Flip eigenvector columns 3,4,5 (1-indexed)
-    if flip_mode_columns_3_to_5 and evecs.shape[1] >= 5:
-        evecs[:, 2:5] *= -1.0
 
     if out_path is None:
         out_path = upper_path + ".vwmatrix"
@@ -234,9 +239,8 @@ def main():
     ap.add_argument("upperhessian", help="Path to upperhessian triplet file")
     ap.add_argument("--out", default=None, help="Output .vwmatrix path (default: <input>.vwmatrix)")
     ap.add_argument("--k", type=int, default=0, help="Eigenpair count (0 => auto)")
-    ap.add_argument("--sigma", type=float, default=None, help="Shift sigma (default: auto from 1e-6)")
+    ap.add_argument("--sigma", type=float, default=None, help=f"Shift sigma (default: {MACHINE_EPS_STR})")
     ap.add_argument("--nonzero-modes", type=int, default=35, help="Desired nonzero modes (auto k = this + 6)")
-    ap.add_argument("--no-flip-345", action="store_true", help="Disable sign flip for eigenvector columns 3-5")
     args = ap.parse_args()
 
     outp = solve_upperhessian_to_vwmatrix(
@@ -245,7 +249,6 @@ def main():
         k=args.k,
         sigma=args.sigma,
         desired_nonzero_modes=args.nonzero_modes,
-        flip_mode_columns_3_to_5=(not args.no_flip_345),
     )
     print(f"Wrote: {outp}")
 
