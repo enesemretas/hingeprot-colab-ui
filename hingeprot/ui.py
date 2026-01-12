@@ -232,11 +232,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     </div>
     """)
 
-    input_mode = W.RadioButtons(
+    input_mode = W.ToggleButtons(
         options=[("Enter PDB code", "code"), ("Upload PDB file", "upload")],
         value="code",
         description="Input:",
-        style={"description_width": "60px"},
+        style={"description_width": "60px", "button_width": "170px"},
         layout=W.Layout(width="420px")
     )
 
