@@ -257,7 +257,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     btn_load = W.Button(description="Load / Detect Chains", button_style="info", icon="search",
                         layout=W.Layout(width="260px"))
     
-    all_chains = W.Checkbox(value=False, description="All chains", layout=W.Layout(width="120px"))
+    all_chains = W.Checkbox(value=False, description="All chains", indent=False, style={"description_width": "initial"}, layout=W.Layout(width="160px", min_width="160px", flex="0 0 160px"))
     # Compact chain checkbox area (wraps on one line)
     chains_label = W.HTML("<b>Select Chains:</b>",  layout=W.Layout(width="120px"))
     chains_wrap = W.Box(
