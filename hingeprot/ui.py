@@ -647,12 +647,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             # We copy upperhessian.vwmatrix -> fort.44 so anm3.py can read it.
             fort44 = os.path.join(state["run_dir"], "fort.44")
             try:
-                shutil.copyfile(out_vw, fort44)
                 _show_log("Prepared eigen input for anm3.py: upperhessian.vwmatrix -> fort.44")
             except Exception as e:
                 raise RuntimeError(f"Failed to prepare fort.44 for anm3.py: {e}")
 
-            cmd5 = ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "fort.44", "--outdir", "."]
+            cmd5 = ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrix", "--outdir", "."]
             _show_log(f"Running: {' '.join(cmd5)}")
             proc5 = subprocess.run(cmd5, cwd=state["run_dir"], capture_output=True, text=True)
 
