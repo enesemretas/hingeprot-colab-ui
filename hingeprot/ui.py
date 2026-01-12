@@ -22,12 +22,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     output.enable_custom_widget_manager()
 
     HINGEPROT_DIR = os.path.dirname(os.path.abspath(__file__))
-    READ_PY = os.path.join(HINGEPROT_DIR, "read.py")
-    GNM_PY = os.path.join(HINGEPROT_DIR, "gnm.py")
-    ANM2_PY = os.path.join(HINGEPROT_DIR, "anm2.py")
-    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")   # k=38, sigma=eps internally
-    ANM3_PY = os.path.join(HINGEPROT_DIR, "anm3.py")       # postprocess eigenvectors -> coor/cross/newcoordinat
-    EXTRACT_PY = os.path.join(HINGEPROT_DIR, "extract.py") # NEW: extract.f port -> hinges, mapping, coor*.mds12
+    READ_PY      = os.path.join(HINGEPROT_DIR, "read.py")
+    GNM_PY       = os.path.join(HINGEPROT_DIR, "gnm.py")
+    ANM2_PY      = os.path.join(HINGEPROT_DIR, "anm2.py")
+    USEBLZ_PY    = os.path.join(HINGEPROT_DIR, "useblz.py")      # k=38, sigma=eps internally
+    ANM3_PY      = os.path.join(HINGEPROT_DIR, "anm3.py")        # postprocess eigenvectors -> *coor/*cross/newcoordinat
+    EXTRACT_PY   = os.path.join(HINGEPROT_DIR, "extract.py")     # extract.f port -> hinges, mapping, coor*.mds12
+    COOR2PDB_PY  = os.path.join(HINGEPROT_DIR, "coor2pdb.py")    # coor2pdb.f port -> 1anm.pdb..36anm.pdb (+ mod1/mod2)
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -57,16 +58,33 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         with open(path, "w", encoding="utf-8") as f:
             f.write(str(text).strip() + "\n")
 
+    def _show_file_sizes(run_dir: str, files: list[str]):
+        for fn in files:
+            p = os.path.join(run_dir, fn)
+            if os.path.exists(p):
+                try:
+                    sz = os.path.getsize(p)
+                    _show_log(f" - {fn}: OK ({sz} bytes)")
+                except Exception:
+                    _show_log(f" - {fn}: OK")
+            else:
+                _show_log(f" - {fn}: MISSING")
+
     def _run(cmd: list[str], cwd: str, title: str):
         _show_log(f"Running: {' '.join(cmd)}")
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-        if proc.stdout.strip():
+        if proc.stdout and proc.stdout.strip():
             _show_log(proc.stdout.rstrip())
-        if proc.stderr.strip():
+        if proc.stderr and proc.stderr.strip():
             _show_log(proc.stderr.rstrip())
         if proc.returncode != 0:
             raise RuntimeError(f"{title} failed (return code {proc.returncode}).")
         return proc
+
+    def _require_files(run_dir: str, relpaths: list[str], step_name: str):
+        missing = [rp for rp in relpaths if not os.path.exists(os.path.join(run_dir, rp))]
+        if missing:
+            raise RuntimeError(f"{step_name}: missing required files: {', '.join(missing)}")
 
     def _preprocess_pdb(
         pdb_in: str,
@@ -232,8 +250,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     css = W.HTML(r"""
     <style>
     .hp-card {border:1px solid #e5e7eb; border-radius:14px; padding:14px 16px; margin:10px 0; background:#fff;}
-    .hp-small {font-size:12px; color:#6b7280; margin-top:6px;}
-
     .hp-banner{
       border:1px solid #e5e7eb;
       border-radius:16px;
@@ -329,15 +345,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     anm_row, get_anm_cut = _list_or_custom_float(
         "ANM cutoff (Å):", options=[10, 13, 15, 18, 20, 23, 36], default_value=18.0, minv=1.0, maxv=100.0
     )
+    rescale_row, get_rescale = _list_or_custom_float(
+        "Rescale:", options=[0.5, 1.0, 1.5, 2.0, 3.0], default_value=1.0, minv=0.01, maxv=100.0, step=0.1
+    )
 
     progress = W.IntProgress(value=0, min=0, max=1, description="Progress:", bar_style="")
     btn_run = W.Button(description="Run", button_style="success", icon="play", layout=W.Layout(width="320px"))
     btn_clear = W.Button(description="Clear", button_style="warning", icon="trash", layout=W.Layout(width="180px"))
-
-    # NEW: rescale factor used by extract.py (extract.f port)
-    rescale_row, get_rescale = _list_or_custom_float(
-        "Rescale:", options=[0.5, 1.0, 1.5, 2.0, 3.0], default_value=1.0, minv=0.01, maxv=100.0, step=0.1
-    )
 
     log_out = W.Output()
 
@@ -561,6 +575,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 (USEBLZ_PY, "useblz.py"),
                 (ANM3_PY, "anm3.py"),
                 (EXTRACT_PY, "extract.py"),
+                (COOR2PDB_PY, "coor2pdb.py"),
             ]:
                 if not os.path.exists(p):
                     raise RuntimeError(f"{name} not found at: {p}")
@@ -581,10 +596,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             gnm_val = float(get_gnm_cut())
             anm_val = float(get_anm_cut())
+            rescale_val = float(get_rescale())
 
             # Steps:
-            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 useblz.py, 7 anm3.py, 8 extract.py, 9 finalize
-            progress.max = 9
+            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 useblz.py,
+            # 7 anm3.py, 8 extract.py, 9 coor2pdb.py, 10 finalize
+            progress.max = 10
             progress.value = 0
             progress.bar_style = "info"
 
@@ -594,8 +611,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             _write_text(os.path.join(run_dir, "gnmcutoff"), gnm_val)
             _write_text(os.path.join(run_dir, "anmcutoff"), anm_val)
+            _write_text(os.path.join(run_dir, "rescale"), rescale_val)  # used by extract.py
             progress.value += 1
-            _show_log("Parameters written: gnmcutoff / anmcutoff")
+            _show_log("Parameters written: gnmcutoff / anmcutoff / rescale")
 
             pdb_out = os.path.join(run_dir, "pdb")
             stats = _preprocess_pdb(
@@ -654,19 +672,17 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             )
             progress.value += 1
 
-            newcoor = os.path.join(run_dir, "newcoordinat.mds")
-            if not os.path.exists(newcoor) or os.path.getsize(newcoor) == 0:
-                raise RuntimeError("anm3.py did not produce newcoordinat.mds (missing/empty).")
+            # anm3 outputs required by extract/coor2pdb
+            _require_files(run_dir, ["newcoordinat.mds"], "anm3.py postcheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 11)], "anm3.py postcheck")  # extract reads 1coor..10coor
             _show_log("anm3.py postprocess done: wrote newcoordinat.mds, eigenanm, *coor, *cross")
 
-            # ---- NEW: run extract.py (extract.f port) ----
-            # extract.py expects 'rescale' file; if you don't already create it elsewhere,
-            # you can set a default here. Comment out if you already manage rescale upstream.
-            rescale_path = os.path.join(run_dir, "rescale")
-            if not os.path.exists(rescale_path):
-                # safe default; change if you have a preferred value
-                _write_text(rescale_path, "1.0")
-                _show_log("NOTE: 'rescale' file was missing; created default rescale=1.0")
+            # ---- run extract.py ----
+            # extract.py needs: coordinates, alpha.cor, slowmodes, crosscorrslow1, crosscorrslow2, 1coor..10coor, newcoordinat.mds
+            _require_files(run_dir, ["coordinates", "alpha.cor", "slowmodes"], "extract.py precheck")
+            _require_files(run_dir, ["crosscorrslow1", "crosscorrslow2"], "extract.py precheck")
+            _require_files(run_dir, ["newcoordinat.mds"], "extract.py precheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 11)], "extract.py precheck")
 
             _run(["python3", EXTRACT_PY], cwd=run_dir, title="extract.py")
             progress.value += 1
@@ -676,32 +692,55 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 raise RuntimeError("extract.py did not produce hinges (missing/empty).")
             _show_log("extract.py done: wrote hinges, mapping.out, anm_length, coor*.mds12, gnm*anmvector")
 
+            # ---- run coor2pdb.py ----
+            # coor2pdb.py expects to read 'pdb' and the coor files in the current run_dir.
+            # It writes: mod1, mod2, and 1anm.pdb..36anm.pdb
+            # If your coor2pdb.py accepts args, adjust the command here accordingly.
+            _require_files(run_dir, ["pdb"], "coor2pdb.py precheck")
+            _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "coor2pdb.py precheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "coor2pdb.py precheck")
+
+            _run(["python3", COOR2PDB_PY], cwd=run_dir, title="coor2pdb.py")
+            progress.value += 1
+
+            # Basic output check
+            one_anm = os.path.join(run_dir, "1anm.pdb")
+            if not os.path.exists(one_anm) or os.path.getsize(one_anm) == 0:
+                raise RuntimeError("coor2pdb.py did not produce 1anm.pdb (missing/empty).")
+            _show_log("coor2pdb.py done: wrote mod1/mod2 and 1anm.pdb..36anm.pdb")
+
             # ---- finalize ----
             progress.value = progress.max
             progress.bar_style = "success"
 
-            _show_log("Done. Files in run folder:")
+            _show_log("Done. Key files in run folder:")
             key_files = [
+                # inputs / preprocessing
                 "pdb", "alpha.cor", "coordinates",
-                "gnmcutoff", "anmcutoff",
+                "gnmcutoff", "anmcutoff", "rescale",
+
+                # gnm
                 "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr",
-                "crosscorrslow1", "crosscorrslow1ext",
+                "crosscorrslow1", "crosscorrslow2", "crosscorrslow1ext",
+
+                # anm
                 "upperhessian", "upperhessian.vwmatrix",
                 "eigenanm", "newcoordinat.mds",
+
                 # extract outputs
-                "rescale", "anm_length", "newcoordinat2.mds", "mapping.out", "hinges",
+                "anm_length", "newcoordinat2.mds", "mapping.out", "hinges",
                 "coor1.mds12", "coor2.mds12", "coor3.mds12", "coor4.mds12",
                 "gnm1anmvector", "gnm2anmvector",
-                # anm3 outputs
-                "1coor", "2coor", "3coor", "4coor", "5coor", "6coor", "7coor", "8coor", "9coor", "10coor",
-                "11coor", "12coor", "13coor", "14coor", "15coor", "16coor", "17coor", "18coor", "19coor", "20coor",
-                "21coor", "22coor", "23coor", "24coor", "25coor", "26coor", "27coor", "28coor", "29coor", "30coor",
-                "31coor", "32coor", "33coor", "34coor", "35coor", "36coor",
-                "1cross", "2cross", "3cross", "4cross", "5cross", "6cross", "7cross", "8cross", "9cross", "10cross",
+
+                # anm3 outputs (coor + cross)
+                *[f"{k}coor" for k in range(1, 37)],
+                *[f"{k}cross" for k in range(1, 11)],
+
+                # coor2pdb outputs
+                "mod1", "mod2",
+                *[f"{k}anm.pdb" for k in range(1, 37)],
             ]
-            for fn in key_files:
-                p = os.path.join(run_dir, fn)
-                _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
+            _show_file_sizes(run_dir, key_files)
 
         except Exception as e:
             progress.bar_style = "danger"
@@ -743,12 +782,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         btn_load,
         W.HTML("<hr>"),
         chain_row,
-        W.VBox([gnm_row, anm_row, rescale_row], layout=W.Layout(gap="8px")),  # <-- add rescale_row here
+        W.VBox([gnm_row, anm_row, rescale_row], layout=W.Layout(gap="8px")),
         progress,
         W.HBox([btn_run, btn_clear]),
         W.HTML("</div>"),
     ])
-
 
     output_card = W.VBox([
         W.HTML('<div class="hp-card"><b>Run Log</b></div>'),
