@@ -306,7 +306,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     )
 
     progress = W.IntProgress(value=0, min=0, max=1, description="Progress:", bar_style="")
-    btn_run  = W.Button(description="Preprocess + run read.py", button_style="success", icon="play",
+    btn_run  = W.Button(description="Run", button_style="success", icon="play",
                         layout=W.Layout(width="320px"))
     btn_clear= W.Button(description="Clear", button_style="warning", icon="trash", layout=W.Layout(width="180px"))
 
