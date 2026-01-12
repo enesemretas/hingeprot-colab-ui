@@ -5,8 +5,6 @@ import requests
 import ipywidgets as W
 from IPython.display import display, clear_output
 
-# Colab-only import happens inside launch()
-
 
 def launch(runs_root: str = "/content/hingeprot_runs"):
     """
@@ -43,17 +41,129 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         chains.add(ch)
         return sorted(chains)
 
-    def _extract_chains_to_file(pdb_in: str, pdb_out: str, chain_str: str):
-        keep = set(chain_str)
+    def _write_text(path: str, text: str):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(text).strip() + "\n")
+
+    def _preprocess_pdb(
+        pdb_in: str,
+        pdb_out: str,
+        chains_keep: set[str] | None,
+        keep_ter: bool = True,
+        keep_only_first_model: bool = True,
+    ) -> dict:
+        """
+        PDB preprocess matching your MATLAB logic (adapted to PDB text):
+
+        - Keep ONLY first MODEL block (if present) else all.
+        - Keep only ATOM (and optionally TER). Drop HETATM and everything else.
+        - altLoc: keep if blank or 'A'
+        - iCode : keep if blank
+        - chain : keep only selected chains (if chains_keep is not None)
+
+        Returns stats dict.
+        """
+        stats = {
+            "lines_read": 0,
+            "lines_written": 0,
+            "atom_written": 0,
+            "ter_written": 0,
+            "altloc_skipped": 0,
+            "icode_skipped": 0,
+            "chain_skipped": 0,
+            "hetatm_skipped": 0,
+            "nonatom_skipped": 0,
+            "used_model_block": False,
+        }
+
+        in_model = False
+        model_found = False
+        model_done = False
+
         with open(pdb_in, "r", encoding="utf-8", errors="ignore") as fin, \
              open(pdb_out, "w", encoding="utf-8") as fout:
+
             for line in fin:
-                if line.startswith(("ATOM  ", "HETATM")) and len(line) > 21:
+                stats["lines_read"] += 1
+                rec = line[:6]
+
+                # MODEL logic: keep only first MODEL block (server-style "Model")
+                if keep_only_first_model:
+                    if rec == "MODEL ":
+                        if not model_found:
+                            model_found = True
+                            in_model = True
+                            stats["used_model_block"] = True
+                        else:
+                            # second MODEL starts — ignore rest
+                            in_model = False
+                            model_done = True
+                        continue
+
+                    if rec == "ENDMDL":
+                        if model_found and in_model:
+                            in_model = False
+                            model_done = True
+                        continue
+
+                    if model_done:
+                        continue
+
+                    # If a MODEL exists, ignore lines until first MODEL begins
+                    if model_found and not in_model:
+                        continue
+
+                # Keep only ATOM (and TER optionally)
+                if rec == "HETATM":
+                    stats["hetatm_skipped"] += 1
+                    continue
+
+                if rec == "TER   ":
+                    if not keep_ter:
+                        stats["nonatom_skipped"] += 1
+                        continue
+                    # chain check if possible
+                    if chains_keep is not None and len(line) > 21:
+                        ch = line[21]
+                        if ch not in chains_keep:
+                            stats["chain_skipped"] += 1
+                            continue
+                    fout.write(line if line.endswith("\n") else line + "\n")
+                    stats["lines_written"] += 1
+                    stats["ter_written"] += 1
+                    continue
+
+                if rec != "ATOM  ":
+                    stats["nonatom_skipped"] += 1
+                    continue
+
+                # chain filter
+                if chains_keep is not None:
+                    if len(line) <= 21:
+                        stats["chain_skipped"] += 1
+                        continue
                     ch = line[21]
-                    if ch in keep:
-                        fout.write(line)
-                else:
-                    fout.write(line)
+                    if ch not in chains_keep:
+                        stats["chain_skipped"] += 1
+                        continue
+
+                # altLoc filter (column 17 in PDB, 0-based index 16)
+                altloc = line[16] if len(line) > 16 else " "
+                if altloc not in (" ", "A"):
+                    stats["altloc_skipped"] += 1
+                    continue
+
+                # iCode filter (column 27 in PDB, 0-based index 26)
+                icode = line[26] if len(line) > 26 else " "
+                if icode != " ":
+                    stats["icode_skipped"] += 1
+                    continue
+
+                fout.write(line if line.endswith("\n") else line + "\n")
+                stats["lines_written"] += 1
+                stats["atom_written"] += 1
+
+        return stats
 
     # ---------- UI helpers ----------
     def _list_or_custom_float(label: str, options, default_value: float,
@@ -67,14 +177,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             opts = sorted(set(opts))
 
         lbl = W.Label(label, layout=W.Layout(width=label_width))
-
         toggle = W.ToggleButtons(
             options=[("List", "list"), ("Custom", "custom")],
             value="list",
             layout=W.Layout(width=toggle_width),
             style={"button_width": "80px"}
         )
-
         dropdown = W.Dropdown(options=opts, value=default_value, layout=W.Layout(width=value_width))
         fbox = W.BoundedFloatText(value=default_value, min=minv, max=maxv, step=step, layout=W.Layout(width=value_width))
         value_box = W.Box([dropdown], layout=W.Layout(align_items="center"))
@@ -103,9 +211,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     <div class="hp-card">
       <div class="hp-title">
         <span style="display:inline-block;width:14px;height:14px;background:#ef4444;border-radius:999px;"></span>
-        <b>HingeProt (Minimal: read.py)</b>
+        <b>HingeProt (Preprocess + read.py)</b>
       </div>
-      <div class="hp-small">Loads PDB → select chains (combined) → writes pdb + coordinates + alpha.cor</div>
+      <div class="hp-small">
+        Preprocess: keep first MODEL, drop HETATM/others, altLoc=blank/A, iCode blank, selected chains → write <b>pdb</b> → run <b>read.py</b>
+      </div>
     </div>
     """)
 
@@ -139,6 +249,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         style={"description_width":"110px"},
         layout=W.Layout(width="420px")
     )
+    all_chains = W.Checkbox(value=False, description="All chains")
 
     gnm_row, get_gnm_cut = _list_or_custom_float(
         "GNM cutoff (Å):", options=[7,8,9,10,11,12,13,20], default_value=10.0, minv=1.0, maxv=100.0
@@ -146,9 +257,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     anm_row, get_anm_cut = _list_or_custom_float(
         "ANM cutoff (Å):", options=[10,13,15,18,20,23,36], default_value=18.0, minv=1.0, maxv=100.0
     )
+    rescale = W.BoundedFloatText(value=1.0, min=0.01, max=100.0, step=0.01, description="Rescale:",
+                                 style={"description_width":"80px"}, layout=W.Layout(width="260px"))
 
     progress = W.IntProgress(value=0, min=0, max=1, description="Progress:", bar_style="")
-    btn_run  = W.Button(description="Run read.py (combined chains)", button_style="success", icon="play",
+    btn_run  = W.Button(description="Preprocess + run read.py", button_style="success", icon="play",
                         layout=W.Layout(width="320px"))
     btn_clear= W.Button(description="Clear", button_style="warning", icon="trash", layout=W.Layout(width="180px"))
 
@@ -159,6 +272,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         "run_dir": None,
         "upload_name": None,
         "upload_bytes": None,
+        "detected_chains": [],
     }
 
     def _show_log(msg: str):
@@ -175,7 +289,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     _sync_input_visibility()
     input_mode.observe(lambda ch: _sync_input_visibility(), names="value")
 
-    # ---- One-click uploader: use unique callback name to avoid collisions ----
+    # ---- One-click uploader: unique callback name to avoid collisions ----
     cb_name = f"hingeprot_uploader_{uuid.uuid4().hex}"
 
     def _js_upload_callback(payload):
@@ -259,11 +373,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             chs = _detect_chains(pdb_path)
             if not chs:
                 raise RuntimeError("No chains detected in the PDB.")
+            state["detected_chains"] = chs
             chains_select.options = chs
             chains_select.value = tuple(chs[:1])
 
             _show_log(f"Detected chains: {chs}")
-            _show_log("Now select one or more chains (combined), then run.")
+            _show_log("Select chain(s) or tick 'All chains', then Run.")
         except Exception as e:
             _show_log(f"ERROR: {e}")
 
@@ -278,35 +393,62 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not os.path.exists(READ_PY):
                 raise RuntimeError(f"read.py not found at: {READ_PY}")
 
-            run_chains = list(chains_select.value)
-            if not run_chains:
-                raise RuntimeError("Please select at least one chain.")
+            detected = state.get("detected_chains") or list(chains_select.options)
+            if not detected:
+                raise RuntimeError("No detected chains. Load again.")
 
-            chain_str = "".join(run_chains)
+            if all_chains.value:
+                chain_list = detected
+            else:
+                chain_list = list(chains_select.value)
+                if not chain_list:
+                    raise RuntimeError("Please select at least one chain (or tick All chains).")
+
+            chain_str = "".join(chain_list)  # combined like "ABC"
+            chains_keep = set(chain_str) if (not all_chains.value) else None  # None == keep all
+
             gnm_val = float(get_gnm_cut())
             anm_val = float(get_anm_cut())
+            rescale_val = float(rescale.value)
 
-            progress.max = 3
+            progress.max = 5
             progress.value = 0
             progress.bar_style = "info"
 
             _show_log(f"Run folder: {state['run_dir']}")
-            _show_log(f"Selected chains (combined): {chain_str}")
-            _show_log(f"Parameters (stored for later steps): gnmcutoff={gnm_val}, anmcutoff={anm_val}")
+            _show_log(f"Selected chains (combined): {chain_str if not all_chains.value else '(ALL)'}")
 
-            # 1) extract selected chains
-            extracted = os.path.join(state["run_dir"], "extracted_input.pdb")
-            _extract_chains_to_file(state["pdb_path"], extracted, chain_str)
+            # Write parameters into run folder for now (later you can also write into hingeprot folder)
+            _write_text(os.path.join(state["run_dir"], "gnmcutoff"), gnm_val)
+            _write_text(os.path.join(state["run_dir"], "anmcutoff"), anm_val)
+            _write_text(os.path.join(state["run_dir"], "rescale"), rescale_val)
             progress.value += 1
-            _show_log("Chain extraction done.")
+            _show_log("Parameters written (gnmcutoff, anmcutoff, rescale) into run folder.")
 
-            # 2) save as 'pdb'
-            pdb_final = os.path.join(state["run_dir"], "pdb")
-            shutil.copy2(extracted, pdb_final)
+            # Preprocess into run_dir/pdb
+            pdb_out = os.path.join(state["run_dir"], "pdb")
+            stats = _preprocess_pdb(
+                pdb_in=state["pdb_path"],
+                pdb_out=pdb_out,
+                chains_keep=chains_keep,          # None => all chains
+                keep_ter=True,
+                keep_only_first_model=True,
+            )
             progress.value += 1
-            _show_log(f"Saved filtered PDB as: {pdb_final}")
+            _show_log("Preprocess done. Output written as 'pdb'.")
+            _show_log(
+                f"Stats: atom_written={stats['atom_written']}, ter_written={stats['ter_written']}, "
+                f"altloc_skipped={stats['altloc_skipped']}, icode_skipped={stats['icode_skipped']}, "
+                f"chain_skipped={stats['chain_skipped']}, hetatm_skipped={stats['hetatm_skipped']}, "
+                f"used_model_block={stats['used_model_block']}"
+            )
 
-            # 3) run read.py
+            if not os.path.exists(pdb_out) or os.path.getsize(pdb_out) == 0:
+                raise RuntimeError("Preprocess produced empty 'pdb'. Check chain selection / filters.")
+
+            progress.value += 1
+
+            # Run read.py in run_dir so outputs land there
             cmd = ["python3", READ_PY, "pdb", "alpha.cor", "coordinates"]
             _show_log(f"Running: {' '.join(cmd)}")
             proc = subprocess.run(cmd, cwd=state["run_dir"], capture_output=True, text=True)
@@ -322,10 +464,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             progress.value += 1
             progress.bar_style = "success"
 
-            _show_log("Done. Produced files:")
-            for fn in ["pdb", "alpha.cor", "coordinates"]:
+            _show_log("Done. Produced files in run folder:")
+            for fn in ["pdb", "alpha.cor", "coordinates", "gnmcutoff", "anmcutoff", "rescale"]:
                 p = os.path.join(state["run_dir"], fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
+
         except Exception as e:
             progress.bar_style = "danger"
             _show_log(f"ERROR: {e}")
@@ -338,11 +481,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         file_lbl.value = "No file chosen"
         chains_select.options = []
         chains_select.value = ()
+        all_chains.value = False
         progress.value = 0
         progress.max = 1
         progress.bar_style = ""
         state["pdb_path"] = None
         state["run_dir"] = None
+        state["detected_chains"] = []
         with log_out:
             clear_output()
 
@@ -358,8 +503,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         upload_box,
         btn_load,
         W.HTML("<hr>"),
+        W.HBox([all_chains]),
         chains_select,
         W.VBox([gnm_row, anm_row], layout=W.Layout(gap="8px")),
+        rescale,
         progress,
         W.HBox([btn_run, btn_clear]),
         W.HTML("</div>"),
