@@ -256,9 +256,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         <div class="hp-title">HINGE<span class="prot">prot</span></div>
         <div class="hp-underline"></div>
         <div class="hp-tagline">An Algorithm For Protein Hinge Prediction Using Elastic Network Models</div>
-        <div class="hp-small">
-          Preprocess: keep first MODEL, drop HETATM/others, altLoc=blank/A, iCode blank, selected chains → write <b>pdb</b> → run <b>read.py</b>
-        </div>
       </div>
     </div>
     """)
