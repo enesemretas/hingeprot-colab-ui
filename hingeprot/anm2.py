@@ -152,9 +152,20 @@ def build_sparse_upper_hessian(coords: np.ndarray, rcut: float, eps2: float = 1e
     return acc
 
 
-def write_upperhessian(sparse_upper: dict[tuple[int, int], float],
-                       outpath: str | Path,
-                       tol: float = 0.0) -> None:
+from pathlib import Path
+
+def write_upperhessian(sparse_upper, outpath, tol: float = 0.0) -> None:
+    items = [((i, j), v) for (i, j), v in sparse_upper.items() if abs(v) > tol]
+    items.sort(key=lambda t: (t[0][0], t[0][1]))
+
+    with Path(outpath).open("w", encoding="utf-8") as f:
+        # leading space to mimic Fortran list-directed
+        f.write(f" {len(items)}\n")
+        for (i, j), v in items:
+            # leading space to mimic Fortran list-directed
+            # Use .10G to get E-notation when needed (closer to Fortran behavior)
+            f.write(f" {i+1} {j+1} {v:.10G}\n")
+          
     """
     Writes:
       first line: count
