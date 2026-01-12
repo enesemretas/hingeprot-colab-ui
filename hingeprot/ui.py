@@ -542,7 +542,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     form_card = W.VBox([
         W.HTML('<div class="hp-card">'),
-        W.HTML("<b>Input</b>"),
         input_mode,
         code_box,
         upload_box,
