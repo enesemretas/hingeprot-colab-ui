@@ -334,6 +334,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     btn_run = W.Button(description="Run", button_style="success", icon="play", layout=W.Layout(width="320px"))
     btn_clear = W.Button(description="Clear", button_style="warning", icon="trash", layout=W.Layout(width="180px"))
 
+    # NEW: rescale factor used by extract.py (extract.f port)
+    rescale_row, get_rescale = _list_or_custom_float(
+        "Rescale:", options=[0.5, 1.0, 1.5, 2.0, 3.0], default_value=1.0, minv=0.01, maxv=100.0, step=0.1
+    )
+
     log_out = W.Output()
 
     state = {
@@ -738,11 +743,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         btn_load,
         W.HTML("<hr>"),
         chain_row,
-        W.VBox([gnm_row, anm_row], layout=W.Layout(gap="8px")),
+        W.VBox([gnm_row, anm_row, rescale_row], layout=W.Layout(gap="8px")),  # <-- add rescale_row here
         progress,
         W.HBox([btn_run, btn_clear]),
         W.HTML("</div>"),
     ])
+
 
     output_card = W.VBox([
         W.HTML('<div class="hp-card"><b>Run Log</b></div>'),
