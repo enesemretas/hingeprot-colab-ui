@@ -25,8 +25,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     READ_PY = os.path.join(HINGEPROT_DIR, "read.py")
     GNM_PY = os.path.join(HINGEPROT_DIR, "gnm.py")
     ANM2_PY = os.path.join(HINGEPROT_DIR, "anm2.py")
-    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")  # k=38, sigma=eps internally
-    ANM3_PY = os.path.join(HINGEPROT_DIR, "anm3.py")      # postprocess eigenvectors -> coor/cross/newcoordinat
+    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")   # k=38, sigma=eps internally
+    ANM3_PY = os.path.join(HINGEPROT_DIR, "anm3.py")       # postprocess eigenvectors -> coor/cross/newcoordinat
+    EXTRACT_PY = os.path.join(HINGEPROT_DIR, "extract.py") # NEW: extract.f port -> hinges, mapping, coor*.mds12
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -554,6 +555,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 (ANM2_PY, "anm2.py"),
                 (USEBLZ_PY, "useblz.py"),
                 (ANM3_PY, "anm3.py"),
+                (EXTRACT_PY, "extract.py"),
             ]:
                 if not os.path.exists(p):
                     raise RuntimeError(f"{name} not found at: {p}")
@@ -576,8 +578,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
 
             # Steps:
-            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 useblz.py, 7 anm3.py, 8 finalize
-            progress.max = 8
+            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 useblz.py, 7 anm3.py, 8 extract.py, 9 finalize
+            progress.max = 9
             progress.value = 0
             progress.bar_style = "info"
 
@@ -652,6 +654,23 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 raise RuntimeError("anm3.py did not produce newcoordinat.mds (missing/empty).")
             _show_log("anm3.py postprocess done: wrote newcoordinat.mds, eigenanm, *coor, *cross")
 
+            # ---- NEW: run extract.py (extract.f port) ----
+            # extract.py expects 'rescale' file; if you don't already create it elsewhere,
+            # you can set a default here. Comment out if you already manage rescale upstream.
+            rescale_path = os.path.join(run_dir, "rescale")
+            if not os.path.exists(rescale_path):
+                # safe default; change if you have a preferred value
+                _write_text(rescale_path, "1.0")
+                _show_log("NOTE: 'rescale' file was missing; created default rescale=1.0")
+
+            _run(["python3", EXTRACT_PY], cwd=run_dir, title="extract.py")
+            progress.value += 1
+
+            hinges_path = os.path.join(run_dir, "hinges")
+            if not os.path.exists(hinges_path) or os.path.getsize(hinges_path) == 0:
+                raise RuntimeError("extract.py did not produce hinges (missing/empty).")
+            _show_log("extract.py done: wrote hinges, mapping.out, anm_length, coor*.mds12, gnm*anmvector")
+
             # ---- finalize ----
             progress.value = progress.max
             progress.bar_style = "success"
@@ -664,6 +683,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 "crosscorrslow1", "crosscorrslow1ext",
                 "upperhessian", "upperhessian.vwmatrix",
                 "eigenanm", "newcoordinat.mds",
+                # extract outputs
+                "rescale", "anm_length", "newcoordinat2.mds", "mapping.out", "hinges",
+                "coor1.mds12", "coor2.mds12", "coor3.mds12", "coor4.mds12",
+                "gnm1anmvector", "gnm2anmvector",
+                # anm3 outputs
                 "1coor", "2coor", "3coor", "4coor", "5coor", "6coor", "7coor", "8coor", "9coor", "10coor",
                 "11coor", "12coor", "13coor", "14coor", "15coor", "16coor", "17coor", "18coor", "19coor", "20coor",
                 "21coor", "22coor", "23coor", "24coor", "25coor", "26coor", "27coor", "28coor", "29coor", "30coor",
