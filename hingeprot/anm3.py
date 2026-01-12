@@ -198,128 +198,202 @@ class EigenData:
     n_modes: int
 
 
-def parse_eigen_file(eig_path: str, max_modes: int = 36) -> EigenData:
+def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | None = None) -> EigenData:
     """
-    Parse the unit=44 file.
+    Supports TWO formats:
 
-    The FORTRAN logic:
-      - skip 12 lines (A7)
-      - read nmax from a line where format is (38x,I5)
-      - find 'vector ' marker, then read eigenvalues until nn>=36
-      - read 36 eigenvectors, each preceded by 'vector ' marker and one dummy line
-      - eigenvector data comes in chunks of 6 floats (last line may be 3)
+    (A) Legacy FORTRAN 'fort.44' style:
+        - header lines
+        - nmax on a fixed-column line
+        - repeated blocks starting with 'vector '
+
+    (B) useblz.py "vwmatrix" style (numeric):
+        - typically starts with k lines of:  <eigenvalue> <residual_or_0>
+        - followed by eigenvector numbers (either row-major or column-major)
+        - no explicit nmax header: we infer nmax from alpha.cor via nmax_expected
     """
     with open(eig_path, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
+        lines = [ln.rstrip("\n") for ln in f]
 
-    idx = 0
+    # ---------- detect legacy 'vector ' blocks ----------
+    if any((_safe_slice(ln, 0, 7) == "vector ") for ln in lines):
+        # ---- legacy parser (your old version), but keep it here ----
+        idx = 0
+        idx += 12
+        if idx >= len(lines):
+            raise RuntimeError(f"Eigen file {eig_path} is too short (missing header).")
 
-    # skip first 12 lines
-    idx += 12
-    if idx >= len(lines):
-        raise RuntimeError(f"Eigen file {eig_path} is too short (missing header).")
-
-    # read nmax from columns 39-43 (1-based) => slice [38:43]
-    nmax_line = lines[idx].rstrip("\n")
-    idx += 1
-    nmax_str = _safe_slice(nmax_line, 38, 43).strip()
-    if not nmax_str:
-        # fallback: try to parse any integer in line
-        toks = nmax_line.split()
-        nmax_str = toks[-1] if toks else ""
-    try:
-        nmax = int(nmax_str)
-    except ValueError:
-        raise RuntimeError(f"Could not parse nmax from eigen file line: {nmax_line!r}")
-
-    jres = nmax // 3
-
-    # helper to find next 'vector ' line
-    def find_next_vector(start: int) -> int:
-        for i in range(start, len(lines)):
-            s = lines[i].rstrip("\n")
-            # FORTRAN reads A7 and compares to 'vector ' (7 chars)
-            if _safe_slice(s, 0, 7) == "vector ":
-                return i
-        return -1
-
-    # --- read eigenvalues w1 ---
-    vec_i = find_next_vector(idx)
-    if vec_i < 0:
-        raise RuntimeError("Could not find 'vector ' marker for eigenvalues section.")
-    idx = vec_i + 1  # next line
-    if idx >= len(lines):
-        raise RuntimeError("Unexpected EOF after eigenvalue 'vector ' marker.")
-    idx += 1  # read(44,*) dummy  (skip one line)
-
-    w1 = np.zeros(max_modes + 1, dtype=float)  # 1..max_modes
-    # read nn, w1(nn), dumn until nn >= max_modes
-    while idx < len(lines):
-        parts = lines[idx].strip().split()
+        nmax_line = lines[idx]
         idx += 1
-        if len(parts) < 2:
-            continue
+        nmax_str = _safe_slice(nmax_line, 38, 43).strip()
+        if not nmax_str:
+            toks = nmax_line.split()
+            nmax_str = toks[-1] if toks else ""
         try:
-            nn = int(float(parts[0]))
+            nmax = int(nmax_str)
         except ValueError:
-            continue
-        try:
-            val = float(parts[1])
-        except ValueError:
-            val = 0.0
-        if 1 <= nn <= max_modes:
-            w1[nn] = val
-        if nn >= max_modes:
-            break
+            raise RuntimeError(f"Could not parse nmax from eigen file line: {nmax_line!r}")
 
-    # --- read eigenvectors v1 ---
-    # v1 is indexed v1(component_index, mode_index)
-    # allocate for nmax components, up to max_modes modes
-    v1 = np.zeros((nmax + 1, max_modes + 1), dtype=float)
+        jres = nmax // 3
 
-    for mode_k in range(1, max_modes + 1):
+        def find_next_vector(start: int) -> int:
+            for i in range(start, len(lines)):
+                if _safe_slice(lines[i], 0, 7) == "vector ":
+                    return i
+            return -1
+
+        # eigenvalues
         vec_i = find_next_vector(idx)
         if vec_i < 0:
-            # fewer modes than expected; stop early
-            n_modes = mode_k - 1
-            break
+            raise RuntimeError("Could not find 'vector ' marker for eigenvalues section.")
         idx = vec_i + 1
-        if idx >= len(lines):
-            n_modes = mode_k - 1
-            break
-        idx += 1  # skip one dummy line after 'vector '
+        idx += 1  # skip dummy line after 'vector '
 
-        filled = 0
-        # fill indices 1..nmax
-        while filled < nmax and idx < len(lines):
+        w1 = np.zeros(max_modes + 1, dtype=float)
+        while idx < len(lines):
             parts = lines[idx].strip().split()
             idx += 1
-            if not parts:
+            if len(parts) < 2:
                 continue
-            # parse floats
-            vals: List[float] = []
-            for p in parts:
-                try:
-                    vals.append(float(p))
-                except ValueError:
-                    pass
-            if not vals:
+            try:
+                nn = int(float(parts[0]))
+            except ValueError:
                 continue
+            try:
+                val = float(parts[1])
+            except ValueError:
+                val = 0.0
+            if 1 <= nn <= max_modes:
+                w1[nn] = val
+            if nn >= max_modes:
+                break
 
-            take = min(nmax - filled, len(vals))
-            # FORTRAN stores to v1(n*6+j,k) with 1-based indexing
-            start_comp = filled + 1
-            end_comp = filled + take
-            v1[start_comp:end_comp + 1, mode_k] = vals[:take]
-            filled += take
+        # eigenvectors
+        v1 = np.zeros((nmax + 1, max_modes + 1), dtype=float)
+        n_modes = 0
 
-        n_modes = mode_k  # last successfully read mode
+        for mode_k in range(1, max_modes + 1):
+            vec_i = find_next_vector(idx)
+            if vec_i < 0:
+                break
+            idx = vec_i + 1
+            idx += 1  # skip one dummy line
 
-    # If loop broke before setting n_modes:
-    if "n_modes" not in locals():
-        n_modes = max_modes
+            filled = 0
+            while filled < nmax and idx < len(lines):
+                parts = lines[idx].strip().split()
+                idx += 1
+                if not parts:
+                    continue
+                vals = []
+                for p in parts:
+                    try:
+                        vals.append(float(p))
+                    except ValueError:
+                        pass
+                if not vals:
+                    continue
 
-    return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=n_modes)
+                take = min(nmax - filled, len(vals))
+                start_comp = filled + 1
+                end_comp = filled + take
+                v1[start_comp:end_comp + 1, mode_k] = vals[:take]
+                filled += take
+
+            n_modes = mode_k
+
+        return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=n_modes)
+
+    # ---------- numeric "vwmatrix" parser ----------
+    if nmax_expected is None or nmax_expected <= 0:
+        raise RuntimeError(
+            "Numeric eigen format detected, but nmax_expected was not provided. "
+            "Pass nmax_expected=3*n_residues from alpha.cor."
+        )
+
+    # Parse floats per line
+    def parse_floats(ln: str) -> list[float]:
+        out = []
+        for tok in ln.strip().split():
+            try:
+                out.append(float(tok))
+            except ValueError:
+                pass
+        return out
+
+    # 1) Read eigenvalue lines at top: consecutive lines with exactly 2 floats
+    eigvals: list[float] = []
+    pos = 0
+    while pos < len(lines):
+        fl = parse_floats(lines[pos])
+        if len(fl) == 2:
+            eigvals.append(fl[0])
+            pos += 1
+        elif len(fl) == 0:
+            pos += 1
+        else:
+            break
+
+    # If none found, fallback: infer k from remaining float count
+    # (rare, but keeps it robust)
+    remaining_lines = lines[pos:]
+    remaining_floats: list[float] = []
+    first_vec_line_float_count: int | None = None
+    for ln in remaining_lines:
+        fl = parse_floats(ln)
+        if fl:
+            if first_vec_line_float_count is None:
+                first_vec_line_float_count = len(fl)
+            remaining_floats.extend(fl)
+
+    if not eigvals:
+        # infer k
+        if len(remaining_floats) < nmax_expected:
+            raise RuntimeError(
+                f"Could not find eigenvalues and not enough data for eigenvectors. "
+                f"Need at least {nmax_expected} floats, got {len(remaining_floats)}."
+            )
+        k_total = len(remaining_floats) // nmax_expected
+        eigvals = [0.0] * k_total
+    else:
+        k_total = len(eigvals)
+
+    if k_total < 16:
+        raise RuntimeError(f"Only {k_total} modes found; need at least 16 for k1=7..k10=16 outputs.")
+
+    need = nmax_expected * k_total
+    if len(remaining_floats) < need:
+        raise RuntimeError(
+            f"Eigenvector data too short. Need {need} floats (=nmax*k), got {len(remaining_floats)}."
+        )
+
+    modes_to_read = min(max_modes, k_total)
+    nmax = nmax_expected
+    jres = nmax // 3
+
+    # Decide layout:
+    # - If first vector line has exactly k_total floats -> likely row-major (each row: all modes)
+    # - Otherwise -> assume column-major (all components of mode1, then mode2, etc.)
+    row_major = (first_vec_line_float_count == k_total)
+
+    w1 = np.zeros(max_modes + 1, dtype=float)
+    for i in range(1, modes_to_read + 1):
+        w1[i] = float(eigvals[i - 1])
+
+    v1 = np.zeros((nmax + 1, max_modes + 1), dtype=float)
+
+    if row_major:
+        mat = np.array(remaining_floats[:need], dtype=float).reshape((nmax, k_total))
+        for m in range(1, modes_to_read + 1):
+            v1[1:nmax + 1, m] = mat[:, m - 1]
+    else:
+        # column-major
+        for m in range(1, modes_to_read + 1):
+            start = (m - 1) * nmax
+            v1[1:nmax + 1, m] = remaining_floats[start:start + nmax]
+
+    return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=modes_to_read)
+
 
 
 def write_eigenanm(outdir: str, eig: EigenData) -> None:
@@ -497,7 +571,8 @@ def main() -> None:
     xxnew, yynew, zznew = compute_centered_coords(alpha)
 
     # Read eigen file (unit 44)
-    eig = parse_eigen_file(args.eig, max_modes=36)
+    nmax_expected = 3 * alpha.resnum
+    eig = parse_eigen_file(args.eig, max_modes=36, nmax_expected=nmax_expected)
 
     # Write eigenanm
     write_eigenanm(outdir, eig)
