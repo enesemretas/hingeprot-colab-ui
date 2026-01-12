@@ -16,6 +16,8 @@ Important:
     This Python version builds the Hessian sparsely to avoid huge dense memory.
   - Hessian is computed with ga=1.0 exactly as in your code.
   - Eigen/inversion is NOT done here (the Fortran ends after writing upperhessian).
+  - Output formatting: we write a leading space on each line and use .10G so small
+    numbers appear in E-notation similar to Fortran list-directed output.
 
 Usage:
   python3 anm2.py
@@ -71,7 +73,7 @@ def read_ca_coords_from_alpha_cor(path: str | Path) -> np.ndarray:
                 atom_name = parts[2].strip()
                 if atom_name != "CA":
                     continue
-                # Typically x y z are columns 6,7,8, but safer to read last three floats
+                # safer to read last three floats
                 x, y, z = map(float, parts[-3:])
                 coords.append((x, y, z))
             except Exception:
@@ -82,7 +84,11 @@ def read_ca_coords_from_alpha_cor(path: str | Path) -> np.ndarray:
     return np.array(coords, dtype=np.float64)
 
 
-def build_sparse_upper_hessian(coords: np.ndarray, rcut: float, eps2: float = 1e-12) -> dict[tuple[int, int], float]:
+def build_sparse_upper_hessian(
+    coords: np.ndarray,
+    rcut: float,
+    eps2: float = 1e-12
+) -> dict[tuple[int, int], float]:
     """
     Builds ANM Hessian (3N x 3N), sparse, storing only the GLOBAL upper triangle (i<=j).
 
@@ -96,10 +102,9 @@ def build_sparse_upper_hessian(coords: np.ndarray, rcut: float, eps2: float = 1e
     if n <= 0:
         return {}
 
-    # Match Fortran intent: positions relative to centroid
     coords_centered = coords - coords.mean(axis=0, keepdims=True)
-
     rcut2 = float(rcut) * float(rcut)
+
     acc: dict[tuple[int, int], float] = {}
 
     def add_to_upper(i: int, j: int, val: float) -> None:
@@ -110,7 +115,7 @@ def build_sparse_upper_hessian(coords: np.ndarray, rcut: float, eps2: float = 1e
         acc[key] = acc.get(key, 0.0) + float(val)
 
     def add_diag_block(base: int, B: np.ndarray, sign: float) -> None:
-        # Add only upper triangle within the 3x3 block to the global upper store
+        # Only upper triangle within this 3x3 block
         for a in range(3):
             ia = base + a
             for b in range(a, 3):
@@ -118,17 +123,16 @@ def build_sparse_upper_hessian(coords: np.ndarray, rcut: float, eps2: float = 1e
                 add_to_upper(ia, ib, sign * B[a, b])
 
     def add_off_block(base_i: int, base_j: int, B: np.ndarray, sign: float) -> None:
-        # For i<j, all (base_i+a, base_j+b) are in global upper triangle already
+        # For i<j, all entries go into global upper
         for a in range(3):
             ia = base_i + a
             for b in range(3):
                 ib = base_j + b
                 add_to_upper(ia, ib, sign * B[a, b])
 
-    # Pair loop (vectorized neighbor detection per i)
     for i in range(n - 1):
-        diffs = coords_centered[i] - coords_centered[i + 1 :]         # (n-i-1, 3)
-        r2 = np.einsum("ij,ij->i", diffs, diffs)                      # (n-i-1,)
+        diffs = coords_centered[i] - coords_centered[i + 1 :]   # (n-i-1, 3)
+        r2 = np.einsum("ij,ij->i", diffs, diffs)
         mask = r2 <= rcut2
         if not np.any(mask):
             continue
@@ -142,44 +146,35 @@ def build_sparse_upper_hessian(coords: np.ndarray, rcut: float, eps2: float = 1e
             if rr2 <= eps2:
                 continue
 
-            B = np.outer(d, d) / rr2  # 3x3, ga=1.0
-
+            B = np.outer(d, d) / rr2  # ga=1.0
             base_j = 3 * j
-            add_diag_block(base_i, B, +1.0)  # dn(3i..,3i..) += ...
-            add_diag_block(base_j, B, +1.0)  # dn(3j..,3j..) += ...
-            add_off_block(base_i, base_j, B, -1.0)  # dn(block i,j) = -...
+
+            add_diag_block(base_i, B, +1.0)
+            add_diag_block(base_j, B, +1.0)
+            add_off_block(base_i, base_j, B, -1.0)
 
     return acc
 
 
-from pathlib import Path
-
-def write_upperhessian(sparse_upper, outpath, tol: float = 0.0) -> None:
-    items = [((i, j), v) for (i, j), v in sparse_upper.items() if abs(v) > tol]
-    items.sort(key=lambda t: (t[0][0], t[0][1]))
-
-    with Path(outpath).open("w", encoding="utf-8") as f:
-        # leading space to mimic Fortran list-directed
-        f.write(f" {len(items)}\n")
-        for (i, j), v in items:
-            # leading space to mimic Fortran list-directed
-            # Use .10G to get E-notation when needed (closer to Fortran behavior)
-            f.write(f" {i+1} {j+1} {v:.10G}\n")
-          
+def write_upperhessian(
+    sparse_upper: dict[tuple[int, int], float],
+    outpath: str | Path,
+    tol: float = 0.0
+) -> None:
     """
-    Writes:
-      first line: count
-      then: i j value
-    using 1-indexed i,j like Fortran.
+    Fortran-like list-directed style:
+      - leading space on every line
+      - uses .10G so very small values show E-notation
+      - indices are 1-based
     """
     items = [((i, j), v) for (i, j), v in sparse_upper.items() if abs(v) > tol]
     items.sort(key=lambda t: (t[0][0], t[0][1]))
 
     out = Path(outpath)
     with out.open("w", encoding="utf-8") as f:
-        f.write(f"{len(items)}\n")
+        f.write(f" {len(items)}\n")
         for (i, j), v in items:
-            f.write(f"{i+1} {j+1} {v:.10f}\n")
+            f.write(f" {i+1} {j+1} {v:.10G}\n")
 
 
 def main() -> None:
