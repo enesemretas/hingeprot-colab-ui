@@ -145,7 +145,7 @@ def _write_vwmatrixd(out_path: str, evals: np.ndarray, errs: np.ndarray, evecs: 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("matrixfile", help="Input sparse matrix file (upper-triangular coordinate format).")
-    ap.add_argument("-k", "--nreig", type=int, default=36, help="Number of eigenpairs to compute (default: 36).")
+    ap.add_argument("-k", "--nreig", type=int, default=41, help="Number of eigenpairs to compute (default: 41).")
     ap.add_argument("--sigma", type=float, default=None, help="Shift σ for shift-invert (eigenvalues near σ).")
     ap.add_argument("--eigl", type=float, default=None, help="Optional interval lower bound; used only to pick σ.")
     ap.add_argument("--eigr", type=float, default=None, help="Optional interval upper bound; used only to pick σ.")
