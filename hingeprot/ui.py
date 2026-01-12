@@ -17,7 +17,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     HINGEPROT_DIR = os.path.dirname(os.path.abspath(__file__))
     READ_PY = os.path.join(HINGEPROT_DIR, "read.py")
     GNM_PY  = os.path.join(HINGEPROT_DIR, "gnm.py")
-    
+    ANM2_PY = os.path.join(HINGEPROT_DIR, "anm2.py")
+
     os.makedirs(runs_root, exist_ok=True)
 
     # ---------- helpers ----------
@@ -258,10 +259,16 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     btn_load = W.Button(description="Load / Detect Chains", button_style="info", icon="search",
                         layout=W.Layout(width="260px"))
-    
-    all_chains = W.Checkbox(value=False, description="All chains", indent=False, style={"description_width": "initial"}, layout=W.Layout(width="120px", min_width="120px", flex="0 0 120px"))
-    # Compact chain checkbox area (wraps on one line)
-    chains_label = W.HTML("<b>Select Chains:</b>",  layout=W.Layout(width="120px"))
+
+    all_chains = W.Checkbox(
+        value=False,
+        description="All Chains",
+        indent=False,
+        style={"description_width": "initial"},
+        layout=W.Layout(width="120px", min_width="120px", flex="0 0 120px")
+    )
+
+    chains_label = W.HTML("<b>Select Chains:</b>", layout=W.Layout(width="120px"))
     chains_wrap = W.Box(
         [],
         layout=W.Layout(
@@ -277,26 +284,26 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             padding="8px 10px",
         )
     )
-    
+
     chain_row = W.HBox([chains_label, chains_wrap], layout=W.Layout(align_items="center", gap="12px", width="100%"))
 
     gnm_row, get_gnm_cut = _list_or_custom_float(
-        "GNM cutoff (Å):", options=[7,8,9,10,11,12,13,20], default_value=10.0, minv=1.0, maxv=100.0
+        "GNM cutoff (Å):", options=[7, 8, 9, 10, 11, 12, 13, 20], default_value=10.0, minv=1.0, maxv=100.0
     )
     anm_row, get_anm_cut = _list_or_custom_float(
-        "ANM cutoff (Å):", options=[10,13,15,18,20,23,36], default_value=18.0, minv=1.0, maxv=100.0
+        "ANM cutoff (Å):", options=[10, 13, 15, 18, 20, 23, 36], default_value=18.0, minv=1.0, maxv=100.0
     )
     rescale = W.BoundedFloatText(
         value=1.0, min=0.01, max=100.0, step=0.01,
         description="Rescale:",
-        style={"description_width":"80px"},
+        style={"description_width": "80px"},
         layout=W.Layout(width="260px")
     )
 
     progress = W.IntProgress(value=0, min=0, max=1, description="Progress:", bar_style="")
-    btn_run  = W.Button(description="Run", button_style="success", icon="play",
-                        layout=W.Layout(width="320px"))
-    btn_clear= W.Button(description="Clear", button_style="warning", icon="trash", layout=W.Layout(width="180px"))
+    btn_run = W.Button(description="Run", button_style="success", icon="play",
+                       layout=W.Layout(width="320px"))
+    btn_clear = W.Button(description="Clear", button_style="warning", icon="trash", layout=W.Layout(width="180px"))
 
     log_out = W.Output()
 
@@ -423,7 +430,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 value=(ch in default_selected),
                 description=ch,
                 indent=False,
-                layout=W.Layout(width="48px", flex="0 0 48px")  # compact
+                layout=W.Layout(width="48px", flex="0 0 48px")
             )
             cb.observe(_on_chain_cb_change, names="value")
             state["chain_cbs"][ch] = cb
@@ -438,7 +445,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             return
 
         if ch["new"] is True:
-            # store manual selection first (if not already all)
             sel = _selected_chains()
             if len(sel) != len(detected):
                 state["manual_selection"] = tuple(sel)
@@ -488,13 +494,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 raise RuntimeError("No chains detected in the PDB.")
             state["detected_chains"] = chs
 
-            # default select first chain
             default_sel = [chs[0]]
             state["manual_selection"] = tuple(default_sel)
-
             _rebuild_chain_checkboxes(chs, default_sel)
 
-            # ensure All chains reflects the selection (OFF)
             state["_syncing"] = True
             try:
                 all_chains.value = False
@@ -515,6 +518,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 raise RuntimeError("Please click 'Load / Detect Chains' first.")
             if not os.path.exists(READ_PY):
                 raise RuntimeError(f"read.py not found at: {READ_PY}")
+            if not os.path.exists(GNM_PY):
+                raise RuntimeError(f"gnm.py not found at: {GNM_PY}")
+            if not os.path.exists(ANM2_PY):
+                raise RuntimeError(f"anm2.py not found at: {ANM2_PY}")
 
             detected = state.get("detected_chains", [])
             if not detected:
@@ -534,7 +541,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
             rescale_val = float(rescale.value)
 
-            progress.max = 6
+            # Now we have 7 steps:
+            # 1 write params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 done-list/finish (visual), etc.
+            progress.max = 7
             progress.value = 0
             progress.bar_style = "info"
 
@@ -567,8 +576,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not os.path.exists(pdb_out) or os.path.getsize(pdb_out) == 0:
                 raise RuntimeError("Preprocess produced empty 'pdb'. Check chain selection / filters.")
 
-            progress.value += 1
-
+            # ---- run read.py -> produces alpha.cor + coordinates ----
             cmd = ["python3", READ_PY, "pdb", "alpha.cor", "coordinates"]
             _show_log(f"Running: {' '.join(cmd)}")
             proc = subprocess.run(cmd, cwd=state["run_dir"], capture_output=True, text=True)
@@ -577,16 +585,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 _show_log(proc.stdout.rstrip())
             if proc.stderr.strip():
                 _show_log(proc.stderr.rstrip())
-
             if proc.returncode != 0:
                 raise RuntimeError(f"read.py failed (return code {proc.returncode}).")
 
-            progress.value += 1
+            progress.value += 1  # read.py done
 
-            # ---- run GNM (uses files: coordinates + gnmcutoff) ----
-            if not os.path.exists(GNM_PY):
-                raise RuntimeError(f"gnm.py not found at: {GNM_PY}")
-
+            # ---- run gnm.py -> uses coordinates + gnmcutoff ----
             cmd2 = ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"]
             _show_log(f"Running: {' '.join(cmd2)}")
             proc2 = subprocess.run(cmd2, cwd=state["run_dir"], capture_output=True, text=True)
@@ -595,16 +599,36 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 _show_log(proc2.stdout.rstrip())
             if proc2.stderr.strip():
                 _show_log(proc2.stderr.rstrip())
-
             if proc2.returncode != 0:
                 raise RuntimeError(f"gnm.py failed (return code {proc2.returncode}).")
 
-            progress.value += 1  # gnm.py done
-            progress.bar_style = "success"
+            progress.value += 1  # gnm done
 
+            # ---- run anm2.py -> uses alpha.cor + anmcutoff ----
+            cmd3 = ["python3", ANM2_PY, "--alpha", "alpha.cor", "--cutoff", "anmcutoff", "--out", "upperhessian"]
+            _show_log(f"Running: {' '.join(cmd3)}")
+            proc3 = subprocess.run(cmd3, cwd=state["run_dir"], capture_output=True, text=True)
+
+            if proc3.stdout.strip():
+                _show_log(proc3.stdout.rstrip())
+            if proc3.stderr.strip():
+                _show_log(proc3.stderr.rstrip())
+            if proc3.returncode != 0:
+                raise RuntimeError(f"anm2.py failed (return code {proc3.returncode}).")
+
+            progress.value += 1  # anm2 done
+
+            progress.bar_style = "success"
+            progress.value = min(progress.value + 1, progress.max)
 
             _show_log("Done. Files in run folder:")
-            for fn in ["pdb", "alpha.cor", "coordinates", "gnmcutoff", "anmcutoff", "rescale", "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr", "crosscorrslow1", "crosscorrslow1ext"]:
+            for fn in [
+                "pdb", "alpha.cor", "coordinates",
+                "gnmcutoff", "anmcutoff", "rescale",
+                "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr",
+                "crosscorrslow1", "crosscorrslow1ext",
+                "upperhessian",
+            ]:
                 p = os.path.join(state["run_dir"], fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
 
