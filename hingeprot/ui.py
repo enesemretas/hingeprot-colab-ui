@@ -19,7 +19,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     READ_PY   = os.path.join(HINGEPROT_DIR, "read.py")
     GNM_PY    = os.path.join(HINGEPROT_DIR, "gnm.py")
     ANM2_PY   = os.path.join(HINGEPROT_DIR, "anm2.py")
-    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")  # auto-k eigensolver
+    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")  # auto-k, sigma=eps internally
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -296,21 +296,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         "ANM cutoff (Å):", options=[10, 13, 15, 18, 20, 23, 36], default_value=18.0, minv=1.0, maxv=100.0
     )
 
-    rescale = W.BoundedFloatText(
-        value=1.0, min=0.01, max=100.0, step=0.01,
-        description="Rescale:",
-        style={"description_width": "80px"},
-        layout=W.Layout(width="260px")
-    )
-
-    # ANM eigensolver controls (auto-k; keep only sigma)
-    anm_sigma = W.BoundedFloatText(
-        value=1e-6, min=-1e6, max=1e6, step=1e-6,
-        description="σ:",
-        style={"description_width": "80px"},
-        layout=W.Layout(width="260px")
-    )
-
     progress = W.IntProgress(value=0, min=0, max=1, description="Progress:", bar_style="")
     btn_run = W.Button(description="Run", button_style="success", icon="play",
                        layout=W.Layout(width="320px"))
@@ -552,7 +537,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             gnm_val = float(get_gnm_cut())
             anm_val = float(get_anm_cut())
-            rescale_val = float(rescale.value)
 
             # Steps:
             # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig (useblz auto-k), 7 finalize
@@ -565,9 +549,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             _write_text(os.path.join(state["run_dir"], "gnmcutoff"), gnm_val)
             _write_text(os.path.join(state["run_dir"], "anmcutoff"), anm_val)
-            _write_text(os.path.join(state["run_dir"], "rescale"), rescale_val)
             progress.value += 1
-            _show_log("Parameters written: gnmcutoff / anmcutoff / rescale")
+            _show_log("Parameters written: gnmcutoff / anmcutoff")
 
             pdb_out = os.path.join(state["run_dir"], "pdb")
             stats = _preprocess_pdb(
@@ -631,13 +614,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             progress.value += 1  # anm2 done
 
-            # ---- ANM sparse eigen solve via useblz.py (AUTO-K) -> writes upperhessian.vwmatrixd ----
+            # ---- ANM sparse eigen solve via useblz.py (AUTO-K, sigma=machine eps internally) ----
             upper_path = os.path.join(state["run_dir"], "upperhessian")
             if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
                 raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
 
-            _show_log(f"Solving eigenproblem with useblz.py (auto-k): sigma={float(anm_sigma.value)}")
-            cmd4 = ["python3", USEBLZ_PY, "upperhessian", "--sigma", str(float(anm_sigma.value))]
+            _show_log("Solving eigenproblem with useblz.py (auto-k, sigma=machine epsilon)...")
+            cmd4 = ["python3", USEBLZ_PY, "upperhessian"]
             _show_log(f"Running: {' '.join(cmd4)}")
             proc4 = subprocess.run(cmd4, cwd=state["run_dir"], capture_output=True, text=True)
 
@@ -648,9 +631,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if proc4.returncode != 0:
                 raise RuntimeError(f"useblz.py failed (return code {proc4.returncode}).")
 
-            out_vw = os.path.join(state["run_dir"], "upperhessian.vwmatrixd")
+            out_vw = os.path.join(state["run_dir"], "upperhessian.vwmatrix")
             if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
-                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrixd (missing/empty).")
+                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrix (missing/empty).")
 
             progress.value += 1
             _show_log(f"Eigen solve done. Wrote: {out_vw}")
@@ -662,10 +645,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _show_log("Done. Files in run folder:")
             for fn in [
                 "pdb", "alpha.cor", "coordinates",
-                "gnmcutoff", "anmcutoff", "rescale",
+                "gnmcutoff", "anmcutoff",
                 "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr",
                 "crosscorrslow1", "crosscorrslow1ext",
-                "upperhessian", "upperhessian.vwmatrixd",
+                "upperhessian", "upperhessian.vwmatrix",
             ]:
                 p = os.path.join(state["run_dir"], fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
@@ -711,8 +694,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         W.HTML("<hr>"),
         chain_row,
         W.VBox([gnm_row, anm_row], layout=W.Layout(gap="8px")),
-        rescale,
-        W.HBox([anm_sigma], layout=W.Layout(gap="10px")),
         progress,
         W.HBox([btn_run, btn_clear]),
         W.HTML("</div>"),
