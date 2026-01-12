@@ -11,17 +11,12 @@ Output:
       first line: number_of_nonzero_upper_triangle_entries
       then lines: i  j  value   (1-indexed) for dn(i,j) where j>=i and dn!=0
 
-Important:
-  - The Fortran allocates dn(15000,15000) but only writes NONZERO upper-triangle entries.
-    This Python version builds the Hessian sparsely to avoid huge dense memory.
-  - Hessian is computed with ga=1.0 exactly as in your code.
-  - Eigen/inversion is NOT done here (the Fortran ends after writing upperhessian).
-  - Output formatting: we write a leading space on each line and use .10G so small
-    numbers appear in E-notation similar to Fortran list-directed output.
-
-Usage:
-  python3 anm2.py
-  python3 anm2.py --alpha alpha.cor --cutoff anmcutoff --out upperhessian
+Formatting goal (to match your Fortran example):
+  - 1 leading space at the start of EVERY line
+  - between 2nd column and value:
+      * 2 spaces if value is positive
+      * 1 space if value is negative
+  - numeric formatting uses .10G so E-notation appears for tiny values.
 """
 
 from __future__ import annotations
@@ -73,7 +68,6 @@ def read_ca_coords_from_alpha_cor(path: str | Path) -> np.ndarray:
                 atom_name = parts[2].strip()
                 if atom_name != "CA":
                     continue
-                # safer to read last three floats
                 x, y, z = map(float, parts[-3:])
                 coords.append((x, y, z))
             except Exception:
@@ -108,6 +102,7 @@ def build_sparse_upper_hessian(
     acc: dict[tuple[int, int], float] = {}
 
     def add_to_upper(i: int, j: int, val: float) -> None:
+        # store only global upper triangle
         if i <= j:
             key = (i, j)
         else:
@@ -115,7 +110,7 @@ def build_sparse_upper_hessian(
         acc[key] = acc.get(key, 0.0) + float(val)
 
     def add_diag_block(base: int, B: np.ndarray, sign: float) -> None:
-        # Only upper triangle within this 3x3 block
+        # only upper triangle within 3x3 block
         for a in range(3):
             ia = base + a
             for b in range(a, 3):
@@ -123,7 +118,7 @@ def build_sparse_upper_hessian(
                 add_to_upper(ia, ib, sign * B[a, b])
 
     def add_off_block(base_i: int, base_j: int, B: np.ndarray, sign: float) -> None:
-        # For i<j, all entries go into global upper
+        # for i<j, all entries are in global upper
         for a in range(3):
             ia = base_i + a
             for b in range(3):
@@ -131,7 +126,7 @@ def build_sparse_upper_hessian(
                 add_to_upper(ia, ib, sign * B[a, b])
 
     for i in range(n - 1):
-        diffs = coords_centered[i] - coords_centered[i + 1 :]   # (n-i-1, 3)
+        diffs = coords_centered[i] - coords_centered[i + 1 :]
         r2 = np.einsum("ij,ij->i", diffs, diffs)
         mask = r2 <= rcut2
         if not np.any(mask):
@@ -162,19 +157,27 @@ def write_upperhessian(
     tol: float = 0.0
 ) -> None:
     """
-    Fortran-like list-directed style:
-      - leading space on every line
-      - uses .10G so very small values show E-notation
-      - indices are 1-based
+    Write in the spacing style you showed from Fortran:
+
+      " 98365"
+      " 1 1  1.53889489"     (positive => TWO spaces between col2 and value)
+      " 1 2 -0.0136846798"   (negative => ONE space between col2 and value)
+
+    Numeric formatting: .10G (so tiny values appear as ...E-06, etc.)
     """
     items = [((i, j), v) for (i, j), v in sparse_upper.items() if abs(v) > tol]
     items.sort(key=lambda t: (t[0][0], t[0][1]))
 
     out = Path(outpath)
     with out.open("w", encoding="utf-8") as f:
+        # leading space on first line
         f.write(f" {len(items)}\n")
+
         for (i, j), v in items:
-            f.write(f" {i+1} {j+1} {v:.10G}\n")
+            vstr = f"{v:.10G}"  # Fortran-like: switches to E for small values
+            sep = "  " if not vstr.startswith("-") else " "  # EXACT rule you requested
+            # leading space at line start
+            f.write(f" {i+1} {j+1}{sep}{vstr}\n")
 
 
 def main() -> None:
