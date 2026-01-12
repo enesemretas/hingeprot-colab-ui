@@ -1,3 +1,4 @@
+# ui.py
 from __future__ import annotations
 
 import os, re, subprocess, datetime, base64, uuid
@@ -196,6 +197,193 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         row = W.HBox([lbl, toggle, value_box], layout=W.Layout(align_items="center", gap="12px"))
         return row, get_value
 
+    # ---- sparse eigensolver (replaces BLZPACK/MA47) ----
+    def _read_upper_tri_coo(path: str):
+        # returns rows0, cols0, data0, n (0-based; n = max index + 1)
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            first = ""
+            while True:
+                first = f.readline()
+                if first == "":
+                    raise ValueError("Empty matrix file.")
+                s = first.strip()
+                if s and not s.startswith(("#", "!", "c", "C")):
+                    break
+            try:
+                declared_na = int(s.split()[0])
+            except Exception as e:
+                raise ValueError(f"Failed to parse first line as integer na: {s!r}") from e
+
+            import numpy as np
+            cap = max(declared_na, 1024)
+            rows = np.empty(cap, dtype=np.int32)
+            cols = np.empty(cap, dtype=np.int32)
+            data = np.empty(cap, dtype=np.float64)
+
+            k = 0
+            nmax = 0
+
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line[0] in "#!":
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+
+                i = int(parts[0])
+                j = int(parts[1])
+                a = float(parts[2])
+
+                if k >= cap:
+                    new_cap = int(cap * 1.5) + 1
+                    rows2 = np.empty(new_cap, dtype=rows.dtype)
+                    cols2 = np.empty(new_cap, dtype=cols.dtype)
+                    data2 = np.empty(new_cap, dtype=data.dtype)
+                    rows2[:k] = rows[:k]
+                    cols2[:k] = cols[:k]
+                    data2[:k] = data[:k]
+                    rows, cols, data = rows2, cols2, data2
+                    cap = new_cap
+
+                rows[k] = i - 1
+                cols[k] = j - 1
+                data[k] = a
+                k += 1
+
+                if i > nmax:
+                    nmax = i
+                if j > nmax:
+                    nmax = j
+
+            rows = rows[:k]
+            cols = cols[:k]
+            data = data[:k]
+            n = nmax
+            if n <= 0:
+                raise ValueError("Matrix size detected as <= 0 (check input indices).")
+            return rows, cols, data, n
+
+    def _build_symmetric_sparse(rows, cols, data, n):
+        import numpy as np
+        from scipy.sparse import coo_matrix
+        off = rows != cols
+        rr = np.concatenate([rows, cols[off]])
+        cc = np.concatenate([cols, rows[off]])
+        dd = np.concatenate([data, data[off]])
+        A = coo_matrix((dd, (rr, cc)), shape=(n, n)).tocsr()
+        A.sum_duplicates()
+        return A
+
+    def _write_vwmatrixd(out_path: str, evals, errs, evecs):
+        # Fortran-like: k n ; k lines eig err ; then x(i,j) in Fortran column-major order
+        import numpy as np
+        n, k = evecs.shape
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(f"{k} {n}\n")
+            for lam, err in zip(evals, errs):
+                f.write(f"{float(lam):.16e} {float(err):.16e}\n")
+
+            flat = np.asarray(evecs, dtype=np.float64).reshape(n * k, order="F")
+            per_line = 5
+            for idx, val in enumerate(flat, start=1):
+                f.write(f"{float(val):.16e}")
+                if idx % per_line == 0:
+                    f.write("\n")
+                else:
+                    f.write(" ")
+            if (n * k) % per_line != 0:
+                f.write("\n")
+
+    def _solve_upperhessian_eigs(
+        matrix_path: str,
+        nreig: int = 36,
+        sigma: float = 1e-6,
+        out_path: str | None = None,
+        tol: float = 0.0,
+        maxiter: int | None = None,
+        ncv: int | None = None,
+    ):
+        """
+        Reads 'upperhessian' (upper triangle coordinate format),
+        computes k eigenpairs near sigma (shift-invert),
+        and writes <matrix_path>.vwmatrixd in the same layout as the Fortran driver.
+        """
+        # Lazy imports (keeps UI snappy)
+        try:
+            import numpy as np
+            from scipy.sparse import eye
+            from scipy.sparse.linalg import eigsh, splu, LinearOperator
+        except Exception:
+            # best-effort install (Colab usually already has it)
+            subprocess.run(["python3", "-m", "pip", "-q", "install", "numpy", "scipy"], check=False)
+            import numpy as np
+            from scipy.sparse import eye
+            from scipy.sparse.linalg import eigsh, splu, LinearOperator
+
+        rows, cols, data, n = _read_upper_tri_coo(matrix_path)
+        A = _build_symmetric_sparse(rows, cols, data, n)
+        A_csc = A.tocsc()
+
+        k = int(nreig)
+        if k <= 0:
+            raise ValueError("nreig must be > 0.")
+        if k >= n:
+            k = max(1, n - 1)
+
+        # Robust factorization attempts (avoid sigma exactly on an eigenvalue)
+        sig = float(sigma)
+        if sig == 0.0:
+            sig = 1e-6
+
+        last_err = None
+        lu = None
+        for _ in range(6):
+            try:
+                Ashift = (A_csc - sig * eye(n, format="csc", dtype=np.float64))
+                lu = splu(Ashift)
+                break
+            except Exception as e:
+                last_err = e
+                sig *= 10.0
+        if lu is None:
+            raise RuntimeError(f"Factorization failed for multiple sigmas. Last error: {last_err}")
+
+        OPinv = LinearOperator((n, n), matvec=lu.solve, dtype=np.float64)
+
+        evals, evecs = eigsh(
+            A,
+            k=k,
+            sigma=sig,
+            which="LM",
+            OPinv=OPinv,
+            tol=float(tol),
+            maxiter=maxiter,
+            ncv=ncv,
+            return_eigenvectors=True,
+        )
+
+        order = np.argsort(evals)
+        evals = evals[order]
+        evecs = evecs[:, order]
+
+        # Residual-based error (like EIG(:,2) usage)
+        Av = A.dot(evecs)
+        eps = 1e-30
+        errs = np.empty(k, dtype=np.float64)
+        for i in range(k):
+            r = Av[:, i] - evals[i] * evecs[:, i]
+            num = float(np.linalg.norm(r))
+            den = float(abs(evals[i]) * np.linalg.norm(evecs[:, i]) + eps)
+            errs[i] = num / den
+
+        if out_path is None:
+            out_path = matrix_path + ".vwmatrixd"
+        _write_vwmatrixd(out_path, evals, errs, evecs)
+        return out_path, float(sig), int(n), int(len(data))
+
     # ---------- UI ----------
     css = W.HTML(r"""
     <style>
@@ -293,9 +481,24 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     anm_row, get_anm_cut = _list_or_custom_float(
         "ANM cutoff (Å):", options=[10, 13, 15, 18, 20, 23, 36], default_value=18.0, minv=1.0, maxv=100.0
     )
+
     rescale = W.BoundedFloatText(
         value=1.0, min=0.01, max=100.0, step=0.01,
         description="Rescale:",
+        style={"description_width": "80px"},
+        layout=W.Layout(width="260px")
+    )
+
+    # ANM eigensolver controls (kept minimal)
+    anm_nreig = W.BoundedIntText(
+        value=36, min=6, max=300, step=1,
+        description="ANM eig k:",
+        style={"description_width": "80px"},
+        layout=W.Layout(width="260px")
+    )
+    anm_sigma = W.BoundedFloatText(
+        value=1e-6, min=-1e6, max=1e6, step=1e-6,
+        description="σ:",
         style={"description_width": "80px"},
         layout=W.Layout(width="260px")
     )
@@ -541,8 +744,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
             rescale_val = float(rescale.value)
 
-            # Now we have 7 steps:
-            # 1 write params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 done-list/finish (visual), etc.
+            # Steps:
+            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig, 7 finalize
             progress.max = 7
             progress.value = 0
             progress.bar_style = "info"
@@ -618,8 +821,28 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             progress.value += 1  # anm2 done
 
+            # ---- ANM sparse eigen solve -> writes upperhessian.vwmatrixd (Fortran-like layout) ----
+            upper_path = os.path.join(state["run_dir"], "upperhessian")
+            if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
+                raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
+
+            _show_log(f"Solving sparse eigenproblem (shift-invert): k={int(anm_nreig.value)}, sigma={float(anm_sigma.value)}")
+            out_vw, used_sigma, n_dim, nnz_in = _solve_upperhessian_eigs(
+                matrix_path=upper_path,
+                nreig=int(anm_nreig.value),
+                sigma=float(anm_sigma.value),
+                out_path=upper_path + ".vwmatrixd",
+                tol=0.0,
+                maxiter=None,
+                ncv=None,
+            )
+            progress.value += 1
+            _show_log(f"Eigen solve done. n={n_dim}, nnz_read={nnz_in}, sigma_used={used_sigma}")
+            _show_log(f"Wrote: {out_vw}")
+
+            # ---- finalize ----
+            progress.value = progress.max
             progress.bar_style = "success"
-            progress.value = min(progress.value + 1, progress.max)
 
             _show_log("Done. Files in run folder:")
             for fn in [
@@ -627,7 +850,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 "gnmcutoff", "anmcutoff", "rescale",
                 "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr",
                 "crosscorrslow1", "crosscorrslow1ext",
-                "upperhessian",
+                "upperhessian", "upperhessian.vwmatrixd",
             ]:
                 p = os.path.join(state["run_dir"], fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
@@ -674,6 +897,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         chain_row,
         W.VBox([gnm_row, anm_row], layout=W.Layout(gap="8px")),
         rescale,
+        W.HBox([anm_nreig, anm_sigma], layout=W.Layout(gap="10px")),
         progress,
         W.HBox([btn_run, btn_clear]),
         W.HTML("</div>"),
