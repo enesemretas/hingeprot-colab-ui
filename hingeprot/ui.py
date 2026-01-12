@@ -16,6 +16,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     HINGEPROT_DIR = os.path.dirname(os.path.abspath(__file__))
     READ_PY = os.path.join(HINGEPROT_DIR, "read.py")
+    GNM_PY  = os.path.join(HINGEPROT_DIR, "gnm.py")
+    
     os.makedirs(runs_root, exist_ok=True)
 
     # ---------- helpers ----------
@@ -532,7 +534,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
             rescale_val = float(rescale.value)
 
-            progress.max = 5
+            progress.max = 6
             progress.value = 0
             progress.bar_style = "info"
 
@@ -580,10 +582,29 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 raise RuntimeError(f"read.py failed (return code {proc.returncode}).")
 
             progress.value += 1
+
+            # ---- run GNM (uses files: coordinates + gnmcutoff) ----
+            if not os.path.exists(GNM_PY):
+                raise RuntimeError(f"gnm.py not found at: {GNM_PY}")
+
+            cmd2 = ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"]
+            _show_log(f"Running: {' '.join(cmd2)}")
+            proc2 = subprocess.run(cmd2, cwd=state["run_dir"], capture_output=True, text=True)
+
+            if proc2.stdout.strip():
+                _show_log(proc2.stdout.rstrip())
+            if proc2.stderr.strip():
+                _show_log(proc2.stderr.rstrip())
+
+            if proc2.returncode != 0:
+                raise RuntimeError(f"gnm.py failed (return code {proc2.returncode}).")
+
+            progress.value += 1  # gnm.py done
             progress.bar_style = "success"
 
+
             _show_log("Done. Files in run folder:")
-            for fn in ["pdb", "alpha.cor", "coordinates", "gnmcutoff", "anmcutoff", "rescale"]:
+            for fn in ["pdb", "alpha.cor", "coordinates", "gnmcutoff", "anmcutoff", "rescale", "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr", "crosscorrslow1", "crosscorrslow1ext"]:
                 p = os.path.join(state["run_dir"], fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
 
