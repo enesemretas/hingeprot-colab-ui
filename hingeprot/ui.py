@@ -53,7 +53,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         keep_only_first_model: bool = True,
     ) -> dict:
         """
-        PDB preprocess matching your MATLAB logic (adapted to PDB text):
+        Preprocess (MATLAB logic adapted to raw PDB text):
 
         - Keep ONLY first MODEL block (if present) else all.
         - Keep only ATOM (and optionally TER). Drop HETATM and everything else.
@@ -87,7 +87,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 stats["lines_read"] += 1
                 rec = line[:6]
 
-                # MODEL logic: keep only first MODEL block (server-style "Model")
+                # MODEL logic: keep only first MODEL block (if present)
                 if keep_only_first_model:
                     if rec == "MODEL ":
                         if not model_found:
@@ -95,7 +95,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                             in_model = True
                             stats["used_model_block"] = True
                         else:
-                            # second MODEL starts — ignore rest
                             in_model = False
                             model_done = True
                         continue
@@ -109,20 +108,20 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     if model_done:
                         continue
 
-                    # If a MODEL exists, ignore lines until first MODEL begins
+                    # If MODEL exists, ignore anything outside the first MODEL
                     if model_found and not in_model:
                         continue
 
-                # Keep only ATOM (and TER optionally)
+                # Drop HETATM
                 if rec == "HETATM":
                     stats["hetatm_skipped"] += 1
                     continue
 
+                # TER optional
                 if rec == "TER   ":
                     if not keep_ter:
                         stats["nonatom_skipped"] += 1
                         continue
-                    # chain check if possible
                     if chains_keep is not None and len(line) > 21:
                         ch = line[21]
                         if ch not in chains_keep:
@@ -133,6 +132,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     stats["ter_written"] += 1
                     continue
 
+                # Keep only ATOM
                 if rec != "ATOM  ":
                     stats["nonatom_skipped"] += 1
                     continue
@@ -147,13 +147,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         stats["chain_skipped"] += 1
                         continue
 
-                # altLoc filter (column 17 in PDB, 0-based index 16)
+                # altLoc filter (col 17 => index 16)
                 altloc = line[16] if len(line) > 16 else " "
                 if altloc not in (" ", "A"):
                     stats["altloc_skipped"] += 1
                     continue
 
-                # iCode filter (column 27 in PDB, 0-based index 26)
+                # iCode filter (col 27 => index 26)
                 icode = line[26] if len(line) > 26 else " "
                 if icode != " ":
                     stats["icode_skipped"] += 1
@@ -198,23 +198,67 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         return row, get_value
 
     # ---------- UI ----------
-    css = W.HTML("""
+    css = W.HTML(r"""
     <style>
     .hp-card {border:1px solid #e5e7eb; border-radius:14px; padding:14px 16px; margin:10px 0; background:#fff;}
-    .hp-title {display:flex; align-items:center; gap:10px; margin-bottom:10px;}
-    .hp-title b {font-size:20px;}
     .hp-small {font-size:12px; color:#6b7280; margin-top:6px;}
+
+    /* Banner like your logo style (text-only, no image) */
+    .hp-banner{
+      border:1px solid #e5e7eb;
+      border-radius:16px;
+      padding:14px 18px;
+      margin:10px 0 12px 0;
+      background:#fff;
+      display:flex;
+      align-items:center;
+      gap:16px;
+      box-shadow: 0 1px 0 rgba(0,0,0,0.03);
+    }
+    .hp-dot{
+      width:14px; height:14px;
+      background:#ef4444;
+      border-radius:999px;
+      flex:0 0 auto;
+    }
+    .hp-title{
+      font-size:34px;
+      font-weight:900;
+      letter-spacing:0.5px;
+      line-height:1.0;
+      margin:0;
+      color:#111827;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    .hp-title .prot{ color:#ef4444; }
+    .hp-underline{
+      height:3px;
+      width:280px;
+      background:#111827;
+      margin-top:6px;
+      border-radius:999px;
+      opacity:0.9;
+    }
+    .hp-tagline{
+      margin-top:6px;
+      font-size:16px;
+      font-weight:800;
+      color:#dc2626;
+      font-family: Arial, Helvetica, sans-serif;
+    }
     </style>
     """)
 
-    header = W.HTML("""
-    <div class="hp-card">
-      <div class="hp-title">
-        <span style="display:inline-block;width:14px;height:14px;background:#ef4444;border-radius:999px;"></span>
-        <b>HingeProt (Preprocess + read.py)</b>
-      </div>
-      <div class="hp-small">
-        Preprocess: keep first MODEL, drop HETATM/others, altLoc=blank/A, iCode blank, selected chains → write <b>pdb</b> → run <b>read.py</b>
+    header = W.HTML(r"""
+    <div class="hp-banner">
+      <div class="hp-dot"></div>
+      <div>
+        <div class="hp-title">HINGE<span class="prot">prot</span></div>
+        <div class="hp-underline"></div>
+        <div class="hp-tagline">An Algorithm For Protein Hinge Prediction Using Elastic Network Models</div>
+        <div class="hp-small">
+          Preprocess: keep first MODEL, drop HETATM/others, altLoc=blank/A, iCode blank, selected chains → write <b>pdb</b> → run <b>read.py</b>
+        </div>
       </div>
     </div>
     """)
@@ -257,8 +301,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     anm_row, get_anm_cut = _list_or_custom_float(
         "ANM cutoff (Å):", options=[10,13,15,18,20,23,36], default_value=18.0, minv=1.0, maxv=100.0
     )
-    rescale = W.BoundedFloatText(value=1.0, min=0.01, max=100.0, step=0.01, description="Rescale:",
-                                 style={"description_width":"80px"}, layout=W.Layout(width="260px"))
+    rescale = W.BoundedFloatText(
+        value=1.0, min=0.01, max=100.0, step=0.01,
+        description="Rescale:",
+        style={"description_width":"80px"},
+        layout=W.Layout(width="260px")
+    )
 
     progress = W.IntProgress(value=0, min=0, max=1, description="Progress:", bar_style="")
     btn_run  = W.Button(description="Preprocess + run read.py", button_style="success", icon="play",
@@ -404,8 +452,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 if not chain_list:
                     raise RuntimeError("Please select at least one chain (or tick All chains).")
 
-            chain_str = "".join(chain_list)  # combined like "ABC"
-            chains_keep = set(chain_str) if (not all_chains.value) else None  # None == keep all
+            chain_str = "".join(chain_list)
+            chains_keep = None if all_chains.value else set(chain_str)
 
             gnm_val = float(get_gnm_cut())
             anm_val = float(get_anm_cut())
@@ -416,21 +464,21 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             progress.bar_style = "info"
 
             _show_log(f"Run folder: {state['run_dir']}")
-            _show_log(f"Selected chains (combined): {chain_str if not all_chains.value else '(ALL)'}")
+            _show_log(f"Selected chains: {(chain_str if not all_chains.value else 'ALL')}")
 
-            # Write parameters into run folder for now (later you can also write into hingeprot folder)
+            # Write parameters into run folder (for now)
             _write_text(os.path.join(state["run_dir"], "gnmcutoff"), gnm_val)
             _write_text(os.path.join(state["run_dir"], "anmcutoff"), anm_val)
             _write_text(os.path.join(state["run_dir"], "rescale"), rescale_val)
             progress.value += 1
-            _show_log("Parameters written (gnmcutoff, anmcutoff, rescale) into run folder.")
+            _show_log("Parameters written: gnmcutoff / anmcutoff / rescale")
 
             # Preprocess into run_dir/pdb
             pdb_out = os.path.join(state["run_dir"], "pdb")
             stats = _preprocess_pdb(
                 pdb_in=state["pdb_path"],
                 pdb_out=pdb_out,
-                chains_keep=chains_keep,          # None => all chains
+                chains_keep=chains_keep,
                 keep_ter=True,
                 keep_only_first_model=True,
             )
@@ -464,7 +512,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             progress.value += 1
             progress.bar_style = "success"
 
-            _show_log("Done. Produced files in run folder:")
+            _show_log("Done. Files in run folder:")
             for fn in ["pdb", "alpha.cor", "coordinates", "gnmcutoff", "anmcutoff", "rescale"]:
                 p = os.path.join(state["run_dir"], fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
@@ -503,7 +551,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         upload_box,
         btn_load,
         W.HTML("<hr>"),
-        W.HBox([all_chains]),
+        all_chains,
         chains_select,
         W.VBox([gnm_row, anm_row], layout=W.Layout(gap="8px")),
         rescale,
