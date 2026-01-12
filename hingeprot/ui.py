@@ -256,15 +256,16 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     btn_load = W.Button(description="Load / Detect Chains", button_style="info", icon="search",
                         layout=W.Layout(width="260px"))
-
-    all_chains = W.Checkbox(value=False, description="All chains")
-
+    
+    all_chains = W.Checkbox(value=False, description="All chains", layout=W.Layout(width="120px"))
     # Compact chain checkbox area (wraps on one line)
-    chains_label = W.HTML("<b>Select Chains:</b>")
+    chains_label = W.HTML("<b>Select Chains:</b>",  layout=W.Layout(width="120px"))
     chains_wrap = W.Box(
         [],
         layout=W.Layout(
-            width="420px",
+            flex="1 1 auto",
+            width="auto",
+            min_width="220px",
             display="flex",
             flex_flow="row wrap",
             align_items="center",
@@ -274,6 +275,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             padding="8px 10px",
         )
     )
+    
+    chain_row = W.HBox([all_chains, chains_label, chains_wrap], layout=W.Layout(align_items="center", gap="12px", width="100%"))
 
     gnm_row, get_gnm_cut = _list_or_custom_float(
         "GNM cutoff (Å):", options=[7,8,9,10,11,12,13,20], default_value=10.0, minv=1.0, maxv=100.0
@@ -623,9 +626,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         upload_box,
         btn_load,
         W.HTML("<hr>"),
-        all_chains,
-        chains_label,
-        chains_wrap,
+        chain_row,
         W.VBox([gnm_row, anm_row], layout=W.Layout(gap="8px")),
         rescale,
         progress,
