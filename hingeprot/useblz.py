@@ -1,147 +1,230 @@
-import math
-import os
+# useblz.py
+from __future__ import annotations
 
-def _to_float(tok: str) -> float:
-    # Handle Fortran D-exponent (e.g., 1.23D-04)
-    return float(tok.replace("D", "E").replace("d", "E"))
+import os
+import math
+import argparse
+from typing import Tuple, Optional
+
+import numpy as np
+from scipy.sparse import coo_matrix, csc_matrix
+from scipy.sparse.linalg import eigsh
+
+
+# ==========================================
+# 1) FORMATTING LOGIC
+# ==========================================
 
 def format_custom_value(val: float) -> str:
     """
-    Applies the custom 9-significant figure and scientific notation logic.
+    Custom 9-significant figure formatting:
+      - 0 -> 0.00000000
+      - |val| < 1e-4 -> scientific with 8 decimals, exponent without '+'
+      - otherwise -> fixed-point with ~9 significant figures
     """
     if val == 0:
         return "0." + "0" * 8
 
     abs_val = abs(val)
 
-    # Use scientific notation for values smaller than 10^-4
     if abs_val < 0.0001:
-        # Uppercase E, no forced '+'
-        return f"{val:.8E}"
+        # " + " removed from exponent part
+        return f"{val:+.8E}".replace("+", "")
 
-    # Fixed point with ~9 significant figures
     if abs_val >= 1.0:
         digits_before = len(str(int(abs_val)))
         decimals = 9 - digits_before
         return f"{val:.{max(0, decimals)}f}"
-    else:
-        leading_zeros = abs(math.floor(math.log10(abs_val))) - 1
-        decimals = 9 + int(leading_zeros)
-        return f"{val:.{decimals}f}"
+
+    # abs_val in (1e-4, 1)
+    leading_zeros = abs(math.floor(math.log10(abs_val))) - 1
+    decimals = 9 + leading_zeros
+    return f"{val:.{decimals}f}"
+
 
 def get_row_start_spacing(is_first_row: bool, first_val_str: str) -> str:
     """
-    Rule 1 & 2: Handles the specific leading spaces for rows.
+    Row leading spaces:
+      - first row => " "
+      - other rows => " " if negative else "  "
     """
     if is_first_row:
-        return " "  # First row always starts with one space
-
-    # Subsequent rows:
-    # If first value is negative: one space
-    # If first value is positive: double space
+        return " "
     return " " if first_val_str.startswith("-") else "  "
 
-def process_eigen_data(
-    input_filename: str,
-    output_filename: str,
-    cwd: str | None = None,
-    logger=None,  # pass _show_log from ui.py if you want
-) -> int:
+
+# ==========================================
+# 2) MATRIX READING LOGIC
+# ==========================================
+
+def read_upperhessian(filename: str) -> Tuple[csc_matrix, int]:
     """
-    Reads eigenpairs from `input_filename` and writes a filtered + formatted vwmatrix to `output_filename`.
-
-    - If `cwd` is provided, paths are resolved relative to cwd.
-    - `logger` can be a function like _show_log(str); if None, uses print().
-    - Returns new_nteig (number of kept eigenvalues).
+    Reads coordinate sparse format:
+      Line 1: na (number of non-zeros) [optional/ignored if not int]
+      Lines 2+: i j value   (1-based indices)
+    Returns:
+      symmetric_mat (CSC), N
     """
-    log = logger if callable(logger) else print
+    if not os.path.exists(filename):
+        raise FileNotFoundError(filename)
 
-    in_path  = os.path.join(cwd, input_filename) if cwd else input_filename
-    out_path = os.path.join(cwd, output_filename) if cwd else output_filename
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    max_idx = -1
 
-    if not os.path.exists(in_path):
-        raise FileNotFoundError(f"Input file '{in_path}' not found.")
+    with open(filename, "r") as f:
+        raw_lines = f.readlines()
 
-    with open(in_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
+    # Try to interpret first line as NA; if not, treat as normal data
+    start = 1
+    try:
+        _ = int(raw_lines[0].strip())
+    except Exception:
+        start = 0
 
-    if not lines:
-        raise RuntimeError(f"Input file '{in_path}' is empty.")
+    for line in raw_lines[start:]:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(("#", "!", "%")):
+            continue
 
-    # Header (Line 1): nteig N
-    header_parts = lines[0].split()
-    if len(header_parts) < 2:
-        raise RuntimeError(f"Bad header in '{in_path}': expected 'nteig N' on line 1.")
-    nteig_orig = int(header_parts[0])
-    N = int(header_parts[1])
+        parts = line.split()
+        if len(parts) < 3:
+            continue
 
-    # Eigenvalues: next nteig_orig lines
-    if len(lines) < 1 + nteig_orig:
-        raise RuntimeError(
-            f"File '{in_path}' too short: expected header + {nteig_orig} eigenvalue lines."
-        )
+        r = int(parts[0]) - 1
+        c = int(parts[1]) - 1
+        v = float(parts[2])
 
-    all_eigenvalues: list[tuple[float, float]] = []
-    for i in range(1, nteig_orig + 1):
-        parts = lines[i].split()
-        if len(parts) < 2:
-            raise RuntimeError(f"Bad eigenvalue line {i+1}: '{lines[i].rstrip()}'")
-        all_eigenvalues.append((_to_float(parts[0]), _to_float(parts[1])))
+        rows.append(r)
+        cols.append(c)
+        data.append(v)
+        if r > max_idx:
+            max_idx = r
+        if c > max_idx:
+            max_idx = c
 
-    # Filter eigenvalues until |imag| > 1e-4
-    filtered_indices: list[int] = []
-    for idx, (_real, imag) in enumerate(all_eigenvalues):
-        if abs(imag) > 0.0001:
-            break
-        filtered_indices.append(idx)
+    if max_idx < 0:
+        raise ValueError(f"No valid (i, j, val) entries found in {filename}")
 
-    new_nteig = len(filtered_indices)
-    log(f"Filtered {nteig_orig} eigenvalues down to {new_nteig}.")
+    N = max_idx + 1
 
-    # Eigenvectors: remaining whitespace-separated floats
-    raw_vector_data = " ".join(lines[nteig_orig + 1 :]).split()
-    vector_vals = [_to_float(x) for x in raw_vector_data]
+    # Build symmetric matrix: include (c,r) for off-diagonals
+    full_rows = rows.copy()
+    full_cols = cols.copy()
+    full_data = data.copy()
 
-    # Sanity check: do we have enough for the last filtered vector?
-    if filtered_indices:
-        need = (max(filtered_indices) + 1) * N
-        if need > len(vector_vals):
-            raise RuntimeError(
-                f"Not enough eigenvector data in '{in_path}': need >= {need} floats, found {len(vector_vals)}."
-            )
+    for r, c, v in zip(rows, cols, data):
+        if r != c:
+            full_rows.append(c)
+            full_cols.append(r)
+            full_data.append(v)
 
-    # Write output
-    with open(out_path, "w", encoding="utf-8") as out:
-        # Row 1 (Dimensions) always starts with one space
-        out.write(" " + f"{new_nteig}  {N}" + "\n")
+    symmetric_mat = coo_matrix((full_data, (full_rows, full_cols)), shape=(N, N)).tocsc()
+    return symmetric_mat, N
 
-        # Eigenvalues
-        for i in range(new_nteig):
-            real_part = format_custom_value(all_eigenvalues[i][0])
-            imag_part = format_custom_value(all_eigenvalues[i][1])
+
+# ==========================================
+# 3) OUTPUT WRITER
+# ==========================================
+
+def write_vwmatrix(output_file: str, evals: np.ndarray, evecs: np.ndarray) -> None:
+    """
+    Writes:
+      row1: " k_modes  N"
+      eigenvalues: real imag(=0) each on new line
+      eigenvectors: each eigenvector written sequentially, 5 numbers per line
+    """
+    k_modes = int(evals.shape[0])
+    N = int(evecs.shape[0])
+
+    with open(output_file, "w") as out:
+        # Dimensions line
+        out.write(" " + f"{k_modes}  {N}" + "\n")
+
+        # Eigenvalues (imag part always 0.0)
+        for i in range(k_modes):
+            real_part = format_custom_value(float(evals[i]))
+            imag_part = format_custom_value(0.0)
 
             leading_space = get_row_start_spacing(False, real_part)
             mid_space = "  " if not imag_part.startswith("-") else " "
             out.write(f"{leading_space}{real_part}{mid_space}{imag_part}\n")
 
-        # Eigenvectors (one vector per line)
-        for j in filtered_indices:
-            start_idx = j * N
-            end_idx = start_idx + N
-            current_vector = vector_vals[start_idx:end_idx]
+        # Eigenvectors (columns)
+        for j in range(k_modes):
+            vec = evecs[:, j]
+            buf: list[str] = []
+            for idx, val in enumerate(vec):
+                f_val = format_custom_value(float(val))
 
-            row_vals_str: list[str] = []
-            for k, val in enumerate(current_vector):
-                f_val = format_custom_value(val)
-
-                if k == 0:
+                if idx % 5 == 0:
+                    if idx > 0:
+                        out.write("".join(buf) + "\n")
+                        buf = []
                     lead = get_row_start_spacing(False, f_val)
-                    row_vals_str.append(lead + f_val)
+                    buf.append(lead + f_val)
                 else:
                     gap = "  " if not f_val.startswith("-") else " "
-                    row_vals_str.append(gap + f_val)
+                    buf.append(gap + f_val)
 
-            out.write("".join(row_vals_str) + "\n")
+            if buf:
+                out.write("".join(buf) + "\n")
 
-    log(f"Successfully created '{out_path}'")
-    return new_nteig
+
+# ==========================================
+# 4) PUBLIC API FOR ui.py
+# ==========================================
+
+def compute_vwmatrix(
+    input_file: str,
+    output_file: Optional[str] = None,
+    k_modes: int = 50,
+    sigma: float = 1e-10,
+) -> str:
+    """
+    Compute eigenpairs near zero using shift-invert (sigma) and write <input>.vwmatrix.
+
+    Returns the output_file path.
+    Raises exceptions instead of sys.exit() so UI can catch & display errors.
+    """
+    if output_file is None:
+        output_file = input_file + ".vwmatrix"
+
+    matrix, N = read_upperhessian(input_file)
+
+    # Guard: eigsh requires 0 < k < N
+    k_eff = min(int(k_modes), max(1, N - 1))
+
+    # Solve eigenvalue problem near 0 (shift-invert)
+    evals, evecs = eigsh(matrix, k=k_eff, sigma=sigma, which="LM")
+
+    # Sort results
+    order = np.argsort(evals)
+    evals = evals[order]
+    evecs = evecs[:, order]
+
+    write_vwmatrix(output_file, evals, evecs)
+    return output_file
+
+
+# ==========================================
+# 5) CLI ENTRYPOINT (kept for subprocess usage)
+# ==========================================
+
+def _main_cli() -> None:
+    ap = argparse.ArgumentParser(description="Compute vwmatrix from upperhess coordinate file.")
+    ap.add_argument("input_file", help="Upper Hessian coordinate file")
+    ap.add_argument("--k", type=int, default=50, help="Number of modes (default: 50)")
+    ap.add_argument("--sigma", type=float, default=1e-10, help="Shift-invert sigma (default: 1e-10)")
+    ap.add_argument("--out", default=None, help="Output file (default: <input>.vwmatrix)")
+    args = ap.parse_args()
+
+    out = compute_vwmatrix(args.input_file, output_file=args.out, k_modes=args.k, sigma=args.sigma)
+    print(out)
+
+
+if __name__ == "__main__":
+    _main_cli()
