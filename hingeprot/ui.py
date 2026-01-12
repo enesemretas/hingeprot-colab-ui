@@ -1,7 +1,7 @@
 # ui.py
 from __future__ import annotations
 
-import os, re, subprocess, datetime, base64, uuid
+import os, re, subprocess, datetime, base64, uuid, shutil
 import requests
 import ipywidgets as W
 from IPython.display import display, clear_output
@@ -20,6 +20,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     GNM_PY    = os.path.join(HINGEPROT_DIR, "gnm.py")
     ANM2_PY   = os.path.join(HINGEPROT_DIR, "anm2.py")
     USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")  # k=38, sigma=eps internally
+    ANM3_PY   = os.path.join(HINGEPROT_DIR, "anm3.py")    # NEW: postprocess eigenvectors -> coor/cross/newcoordinat
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -520,6 +521,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 raise RuntimeError(f"anm2.py not found at: {ANM2_PY}")
             if not os.path.exists(USEBLZ_PY):
                 raise RuntimeError(f"useblz.py not found at: {USEBLZ_PY}")
+            if not os.path.exists(ANM3_PY):
+                raise RuntimeError(f"anm3.py not found at: {ANM3_PY}")
 
             detected = state.get("detected_chains", [])
             if not detected:
@@ -539,8 +542,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
 
             # Steps:
-            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig (useblz), 7 finalize
-            progress.max = 7
+            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig (useblz),
+            # 7 anm3.py postprocess, 8 finalize
+            progress.max = 8
             progress.value = 0
             progress.bar_style = "info"
 
@@ -638,17 +642,55 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             progress.value += 1
             _show_log(f"Eigen solve done. Wrote: {out_vw}")
 
+            # ---- NEW: run anm3.py to generate coor/cross + newcoordinat.mds ----
+            # The original FORTRAN opened unit=44 with no filename (commonly fort.44).
+            # We copy upperhessian.vwmatrix -> fort.44 so anm3.py can read it.
+            fort44 = os.path.join(state["run_dir"], "fort.44")
+            try:
+                shutil.copyfile(out_vw, fort44)
+                _show_log("Prepared eigen input for anm3.py: upperhessian.vwmatrix -> fort.44")
+            except Exception as e:
+                raise RuntimeError(f"Failed to prepare fort.44 for anm3.py: {e}")
+
+            cmd5 = ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "fort.44", "--outdir", "."]
+            _show_log(f"Running: {' '.join(cmd5)}")
+            proc5 = subprocess.run(cmd5, cwd=state["run_dir"], capture_output=True, text=True)
+
+            if proc5.stdout.strip():
+                _show_log(proc5.stdout.rstrip())
+            if proc5.stderr.strip():
+                _show_log(proc5.stderr.rstrip())
+            if proc5.returncode != 0:
+                raise RuntimeError(f"anm3.py failed (return code {proc5.returncode}).")
+
+            newcoor = os.path.join(state["run_dir"], "newcoordinat.mds")
+            if not os.path.exists(newcoor) or os.path.getsize(newcoor) == 0:
+                raise RuntimeError("anm3.py did not produce newcoordinat.mds (missing/empty).")
+
+            progress.value += 1
+            _show_log("anm3.py postprocess done: wrote newcoordinat.mds, eigenanm, *coor, *cross")
+
             # ---- finalize ----
             progress.value = progress.max
             progress.bar_style = "success"
 
             _show_log("Done. Files in run folder:")
             for fn in [
+                # inputs / preprocessing
                 "pdb", "alpha.cor", "coordinates",
                 "gnmcutoff", "anmcutoff",
+                # gnm outputs (as previously listed)
                 "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr",
                 "crosscorrslow1", "crosscorrslow1ext",
-                "upperhessian", "upperhessian.vwmatrix",
+                # anm outputs
+                "upperhessian", "upperhessian.vwmatrix", "fort.44",
+                # anm3 outputs
+                "eigenanm", "newcoordinat.mds",
+                "1coor", "2coor", "3coor", "4coor", "5coor", "6coor", "7coor", "8coor", "9coor", "10coor",
+                "11coor", "12coor", "13coor", "14coor", "15coor", "16coor", "17coor", "18coor", "19coor", "20coor",
+                "21coor", "22coor", "23coor", "24coor", "25coor", "26coor", "27coor", "28coor", "29coor", "30coor",
+                "31coor", "32coor", "33coor", "34coor", "35coor", "36coor",
+                "1cross", "2cross", "3cross", "4cross", "5cross", "6cross", "7cross", "8cross", "9cross", "10cross",
             ]:
                 p = os.path.join(state["run_dir"], fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
