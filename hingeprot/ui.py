@@ -660,13 +660,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _run(["python3", USEBLZ_PY, "upperhessian"], cwd=run_dir, title="useblz.py")
             progress.value += 1
 
-            out_vw = os.path.join(run_dir, "upperhessian.vwmatrix")
+            out_vw = os.path.join(run_dir, "upperhessian.vwmatrixd")
             if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
                 raise RuntimeError("useblz.py did not produce upperhessian.vwmatrix (missing/empty).")
             _show_log(f"Eigen solve done. Wrote: {out_vw}")
 
             _run(
-                ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrix", "--outdir", "."],
+                ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrixd", "--outdir", "."],
                 cwd=run_dir,
                 title="anm3.py",
             )
