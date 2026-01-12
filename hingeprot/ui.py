@@ -257,7 +257,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     btn_load = W.Button(description="Load / Detect Chains", button_style="info", icon="search",
                         layout=W.Layout(width="260px"))
     
-    all_chains = W.Checkbox(value=False, description="All chains", indent=False, style={"description_width": "initial"}, layout=W.Layout(width="160px", min_width="160px", flex="0 0 160px"))
+    all_chains = W.Checkbox(value=False, description="All chains", indent=False, style={"description_width": "initial"}, layout=W.Layout(width="120px", min_width="120px", flex="0 0 120px"))
     # Compact chain checkbox area (wraps on one line)
     chains_label = W.HTML("<b>Select Chains:</b>",  layout=W.Layout(width="120px"))
     chains_wrap = W.Box(
@@ -276,7 +276,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         )
     )
     
-    chain_row = W.HBox([all_chains, chains_label, chains_wrap], layout=W.Layout(align_items="center", gap="12px", width="100%"))
+    chain_row = W.HBox([chains_label, chains_wrap], layout=W.Layout(align_items="center", gap="12px", width="100%"))
 
     gnm_row, get_gnm_cut = _list_or_custom_float(
         "GNM cutoff (Å):", options=[7,8,9,10,11,12,13,20], default_value=10.0, minv=1.0, maxv=100.0
@@ -415,13 +415,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     def _rebuild_chain_checkboxes(chains: list[str], default_selected: list[str]):
         state["chain_cbs"] = {}
-        items = []
+        items = [all_chains]
         for ch in chains:
             cb = W.Checkbox(
                 value=(ch in default_selected),
                 description=ch,
                 indent=False,
-                layout=W.Layout(width="48px")  # compact
+                layout=W.Layout(width="48px", flex="0 0 48px")  # compact
             )
             cb.observe(_on_chain_cb_change, names="value")
             state["chain_cbs"][ch] = cb
