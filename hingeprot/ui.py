@@ -1,7 +1,13 @@
 # ui.py
 from __future__ import annotations
 
-import os, re, subprocess, datetime, base64, uuid, shutil
+import os
+import re
+import subprocess
+import datetime
+import base64
+import uuid
+
 import requests
 import ipywidgets as W
 from IPython.display import display, clear_output
@@ -16,11 +22,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     output.enable_custom_widget_manager()
 
     HINGEPROT_DIR = os.path.dirname(os.path.abspath(__file__))
-    READ_PY   = os.path.join(HINGEPROT_DIR, "read.py")
-    GNM_PY    = os.path.join(HINGEPROT_DIR, "gnm.py")
-    ANM2_PY   = os.path.join(HINGEPROT_DIR, "anm2.py")
+    READ_PY = os.path.join(HINGEPROT_DIR, "read.py")
+    GNM_PY = os.path.join(HINGEPROT_DIR, "gnm.py")
+    ANM2_PY = os.path.join(HINGEPROT_DIR, "anm2.py")
     USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")  # k=38, sigma=eps internally
-    ANM3_PY   = os.path.join(HINGEPROT_DIR, "anm3.py")    # NEW: postprocess eigenvectors -> coor/cross/newcoordinat
+    ANM3_PY = os.path.join(HINGEPROT_DIR, "anm3.py")      # postprocess eigenvectors -> coor/cross/newcoordinat
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -36,7 +42,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(r.text)
 
-    def _detect_chains(pdb_path: str):
+    def _detect_chains(pdb_path: str) -> list[str]:
         chains = set()
         with open(pdb_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -49,6 +55,17 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     def _write_text(path: str, text: str):
         with open(path, "w", encoding="utf-8") as f:
             f.write(str(text).strip() + "\n")
+
+    def _run(cmd: list[str], cwd: str, title: str):
+        _show_log(f"Running: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        if proc.stdout.strip():
+            _show_log(proc.stdout.rstrip())
+        if proc.stderr.strip():
+            _show_log(proc.stderr.rstrip())
+        if proc.returncode != 0:
+            raise RuntimeError(f"{title} failed (return code {proc.returncode}).")
+        return proc
 
     def _preprocess_pdb(
         pdb_in: str,
@@ -168,9 +185,17 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
         return stats
 
-    def _list_or_custom_float(label: str, options, default_value: float,
-                              minv: float, maxv: float, step: float = 0.1,
-                              label_width="120px", toggle_width="180px", value_width="240px"):
+    def _list_or_custom_float(
+        label: str,
+        options,
+        default_value: float,
+        minv: float,
+        maxv: float,
+        step: float = 0.1,
+        label_width: str = "120px",
+        toggle_width: str = "180px",
+        value_width: str = "240px",
+    ):
         opts = [float(x) for x in options]
         default_value = float(default_value)
         if default_value not in opts:
@@ -183,14 +208,17 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             options=[("List", "list"), ("Custom", "custom")],
             value="list",
             layout=W.Layout(width=toggle_width),
-            style={"button_width": "80px"}
+            style={"button_width": "80px"},
         )
         dropdown = W.Dropdown(options=opts, value=default_value, layout=W.Layout(width=value_width))
-        fbox = W.BoundedFloatText(value=default_value, min=minv, max=maxv, step=step, layout=W.Layout(width=value_width))
+        fbox = W.BoundedFloatText(
+            value=default_value, min=minv, max=maxv, step=step, layout=W.Layout(width=value_width)
+        )
         value_box = W.Box([dropdown], layout=W.Layout(align_items="center"))
 
         def _on_toggle(ch):
             value_box.children = [dropdown] if ch["new"] == "list" else [fbox]
+
         toggle.observe(_on_toggle, names="value")
 
         def get_value() -> float:
@@ -243,7 +271,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         value="code",
         description="Input:",
         style={"description_width": "60px", "button_width": "170px"},
-        layout=W.Layout(width="420px")
+        layout=W.Layout(width="420px"),
     )
 
     pdb_code = W.Text(
@@ -251,7 +279,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         description="PDB code:",
         placeholder="e.g., 4cln",
         style={"description_width": "80px"},
-        layout=W.Layout(width="420px")
+        layout=W.Layout(width="420px"),
     )
 
     btn_choose_file = W.Button(description="Choose file", icon="upload", layout=W.Layout(width="180px"))
@@ -260,15 +288,19 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     code_box = W.HBox([pdb_code], layout=W.Layout(align_items="center"))
     upload_box = W.HBox([btn_choose_file, file_lbl], layout=W.Layout(align_items="center", gap="10px"))
 
-    btn_load = W.Button(description="Load / Detect Chains", button_style="info", icon="search",
-                        layout=W.Layout(width="260px"))
+    btn_load = W.Button(
+        description="Load / Detect Chains",
+        button_style="info",
+        icon="search",
+        layout=W.Layout(width="260px"),
+    )
 
     all_chains = W.Checkbox(
         value=False,
         description="All Chains",
         indent=False,
         style={"description_width": "initial"},
-        layout=W.Layout(width="120px", min_width="120px", flex="0 0 120px")
+        layout=W.Layout(width="120px", min_width="120px", flex="0 0 120px"),
     )
 
     chains_label = W.HTML("<b>Select Chains:</b>", layout=W.Layout(width="120px"))
@@ -285,7 +317,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             border="1px solid #e5e7eb",
             border_radius="12px",
             padding="8px 10px",
-        )
+        ),
     )
 
     chain_row = W.HBox([chains_label, chains_wrap], layout=W.Layout(align_items="center", gap="12px", width="100%"))
@@ -298,8 +330,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     )
 
     progress = W.IntProgress(value=0, min=0, max=1, description="Progress:", bar_style="")
-    btn_run = W.Button(description="Run", button_style="success", icon="play",
-                       layout=W.Layout(width="320px"))
+    btn_run = W.Button(description="Run", button_style="success", icon="play", layout=W.Layout(width="320px"))
     btn_clear = W.Button(description="Clear", button_style="warning", icon="trash", layout=W.Layout(width="180px"))
 
     log_out = W.Output()
@@ -326,6 +357,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         else:
             code_box.layout.display = "none"
             upload_box.layout.display = ""
+
     _sync_input_visibility()
     input_mode.observe(lambda ch: _sync_input_visibility(), names="value")
 
@@ -404,6 +436,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         detected = state.get("detected_chains", [])
         if not detected:
             return
+
         sel = _selected_chains()
         all_now = (len(sel) == len(detected)) and (len(detected) > 0)
 
@@ -427,7 +460,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 value=(ch in default_selected),
                 description=ch,
                 indent=False,
-                layout=W.Layout(width="48px", flex="0 0 48px")
+                layout=W.Layout(width="48px", flex="0 0 48px"),
             )
             cb.observe(_on_chain_cb_change, names="value")
             state["chain_cbs"][ch] = cb
@@ -437,6 +470,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     def _on_all_chains_toggle(ch):
         if state["_syncing"]:
             return
+
         detected = state.get("detected_chains", [])
         if not detected:
             return
@@ -513,16 +547,16 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         try:
             if not state["pdb_path"] or not os.path.exists(state["pdb_path"]):
                 raise RuntimeError("Please click 'Load / Detect Chains' first.")
-            if not os.path.exists(READ_PY):
-                raise RuntimeError(f"read.py not found at: {READ_PY}")
-            if not os.path.exists(GNM_PY):
-                raise RuntimeError(f"gnm.py not found at: {GNM_PY}")
-            if not os.path.exists(ANM2_PY):
-                raise RuntimeError(f"anm2.py not found at: {ANM2_PY}")
-            if not os.path.exists(USEBLZ_PY):
-                raise RuntimeError(f"useblz.py not found at: {USEBLZ_PY}")
-            if not os.path.exists(ANM3_PY):
-                raise RuntimeError(f"anm3.py not found at: {ANM3_PY}")
+
+            for p, name in [
+                (READ_PY, "read.py"),
+                (GNM_PY, "gnm.py"),
+                (ANM2_PY, "anm2.py"),
+                (USEBLZ_PY, "useblz.py"),
+                (ANM3_PY, "anm3.py"),
+            ]:
+                if not os.path.exists(p):
+                    raise RuntimeError(f"{name} not found at: {p}")
 
             detected = state.get("detected_chains", [])
             if not detected:
@@ -542,21 +576,21 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
 
             # Steps:
-            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 ANM eig (useblz),
-            # 7 anm3.py postprocess, 8 finalize
+            # 1 params, 2 preprocess, 3 read.py, 4 gnm.py, 5 anm2.py, 6 useblz.py, 7 anm3.py, 8 finalize
             progress.max = 8
             progress.value = 0
             progress.bar_style = "info"
 
-            _show_log(f"Run folder: {state['run_dir']}")
+            run_dir = state["run_dir"]
+            _show_log(f"Run folder: {run_dir}")
             _show_log(f"Selected chains: {(chain_str if not all_chains.value else 'ALL')}")
 
-            _write_text(os.path.join(state["run_dir"], "gnmcutoff"), gnm_val)
-            _write_text(os.path.join(state["run_dir"], "anmcutoff"), anm_val)
+            _write_text(os.path.join(run_dir, "gnmcutoff"), gnm_val)
+            _write_text(os.path.join(run_dir, "anmcutoff"), anm_val)
             progress.value += 1
             _show_log("Parameters written: gnmcutoff / anmcutoff")
 
-            pdb_out = os.path.join(state["run_dir"], "pdb")
+            pdb_out = os.path.join(run_dir, "pdb")
             stats = _preprocess_pdb(
                 pdb_in=state["pdb_path"],
                 pdb_out=pdb_out,
@@ -576,97 +610,46 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not os.path.exists(pdb_out) or os.path.getsize(pdb_out) == 0:
                 raise RuntimeError("Preprocess produced empty 'pdb'. Check chain selection / filters.")
 
-            # ---- run read.py -> produces alpha.cor + coordinates ----
-            cmd = ["python3", READ_PY, "pdb", "alpha.cor", "coordinates"]
-            _show_log(f"Running: {' '.join(cmd)}")
-            proc = subprocess.run(cmd, cwd=state["run_dir"], capture_output=True, text=True)
+            _run(["python3", READ_PY, "pdb", "alpha.cor", "coordinates"], cwd=run_dir, title="read.py")
+            progress.value += 1
 
-            if proc.stdout.strip():
-                _show_log(proc.stdout.rstrip())
-            if proc.stderr.strip():
-                _show_log(proc.stderr.rstrip())
-            if proc.returncode != 0:
-                raise RuntimeError(f"read.py failed (return code {proc.returncode}).")
+            _run(
+                ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"],
+                cwd=run_dir,
+                title="gnm.py",
+            )
+            progress.value += 1
 
-            progress.value += 1  # read.py done
+            _run(
+                ["python3", ANM2_PY, "--alpha", "alpha.cor", "--cutoff", "anmcutoff", "--out", "upperhessian"],
+                cwd=run_dir,
+                title="anm2.py",
+            )
+            progress.value += 1
 
-            # ---- run gnm.py -> uses coordinates + gnmcutoff ----
-            cmd2 = ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"]
-            _show_log(f"Running: {' '.join(cmd2)}")
-            proc2 = subprocess.run(cmd2, cwd=state["run_dir"], capture_output=True, text=True)
-
-            if proc2.stdout.strip():
-                _show_log(proc2.stdout.rstrip())
-            if proc2.stderr.strip():
-                _show_log(proc2.stderr.rstrip())
-            if proc2.returncode != 0:
-                raise RuntimeError(f"gnm.py failed (return code {proc2.returncode}).")
-
-            progress.value += 1  # gnm done
-
-            # ---- run anm2.py -> uses alpha.cor + anmcutoff ----
-            cmd3 = ["python3", ANM2_PY, "--alpha", "alpha.cor", "--cutoff", "anmcutoff", "--out", "upperhessian"]
-            _show_log(f"Running: {' '.join(cmd3)}")
-            proc3 = subprocess.run(cmd3, cwd=state["run_dir"], capture_output=True, text=True)
-
-            if proc3.stdout.strip():
-                _show_log(proc3.stdout.rstrip())
-            if proc3.stderr.strip():
-                _show_log(proc3.stderr.rstrip())
-            if proc3.returncode != 0:
-                raise RuntimeError(f"anm2.py failed (return code {proc3.returncode}).")
-
-            progress.value += 1  # anm2 done
-
-            # ---- ANM sparse eigen solve via useblz.py (k=38, sigma=machine eps internally) ----
-            upper_path = os.path.join(state["run_dir"], "upperhessian")
+            upper_path = os.path.join(run_dir, "upperhessian")
             if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
                 raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
 
             _show_log("Solving eigenproblem with useblz.py (k=38, sigma=machine epsilon)...")
-            cmd4 = ["python3", USEBLZ_PY, "upperhessian"]
-            _show_log(f"Running: {' '.join(cmd4)}")
-            proc4 = subprocess.run(cmd4, cwd=state["run_dir"], capture_output=True, text=True)
+            _run(["python3", USEBLZ_PY, "upperhessian"], cwd=run_dir, title="useblz.py")
+            progress.value += 1
 
-            if proc4.stdout.strip():
-                _show_log(proc4.stdout.rstrip())
-            if proc4.stderr.strip():
-                _show_log(proc4.stderr.rstrip())
-            if proc4.returncode != 0:
-                raise RuntimeError(f"useblz.py failed (return code {proc4.returncode}).")
-
-            out_vw = os.path.join(state["run_dir"], "upperhessian.vwmatrix")
+            out_vw = os.path.join(run_dir, "upperhessian.vwmatrix")
             if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
                 raise RuntimeError("useblz.py did not produce upperhessian.vwmatrix (missing/empty).")
-
-            progress.value += 1
             _show_log(f"Eigen solve done. Wrote: {out_vw}")
 
-            # ---- NEW: run anm3.py to generate coor/cross + newcoordinat.mds ----
-            # The original FORTRAN opened unit=44 with no filename (commonly fort.44).
-            # We copy upperhessian.vwmatrix -> fort.44 so anm3.py can read it.
-            fort44 = os.path.join(state["run_dir"], "fort.44")
-            try:
-                _show_log("Prepared eigen input for anm3.py: upperhessian.vwmatrix -> fort.44")
-            except Exception as e:
-                raise RuntimeError(f"Failed to prepare fort.44 for anm3.py: {e}")
+            _run(
+                ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrix", "--outdir", "."],
+                cwd=run_dir,
+                title="anm3.py",
+            )
+            progress.value += 1
 
-            cmd5 = ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrix", "--outdir", "."]
-            _show_log(f"Running: {' '.join(cmd5)}")
-            proc5 = subprocess.run(cmd5, cwd=state["run_dir"], capture_output=True, text=True)
-
-            if proc5.stdout.strip():
-                _show_log(proc5.stdout.rstrip())
-            if proc5.stderr.strip():
-                _show_log(proc5.stderr.rstrip())
-            if proc5.returncode != 0:
-                raise RuntimeError(f"anm3.py failed (return code {proc5.returncode}).")
-
-            newcoor = os.path.join(state["run_dir"], "newcoordinat.mds")
+            newcoor = os.path.join(run_dir, "newcoordinat.mds")
             if not os.path.exists(newcoor) or os.path.getsize(newcoor) == 0:
                 raise RuntimeError("anm3.py did not produce newcoordinat.mds (missing/empty).")
-
-            progress.value += 1
             _show_log("anm3.py postprocess done: wrote newcoordinat.mds, eigenanm, *coor, *cross")
 
             # ---- finalize ----
@@ -674,24 +657,21 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             progress.bar_style = "success"
 
             _show_log("Done. Files in run folder:")
-            for fn in [
-                # inputs / preprocessing
+            key_files = [
                 "pdb", "alpha.cor", "coordinates",
                 "gnmcutoff", "anmcutoff",
-                # gnm outputs (as previously listed)
                 "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr",
                 "crosscorrslow1", "crosscorrslow1ext",
-                # anm outputs
-                "upperhessian", "upperhessian.vwmatrix", "fort.44",
-                # anm3 outputs
+                "upperhessian", "upperhessian.vwmatrix",
                 "eigenanm", "newcoordinat.mds",
                 "1coor", "2coor", "3coor", "4coor", "5coor", "6coor", "7coor", "8coor", "9coor", "10coor",
                 "11coor", "12coor", "13coor", "14coor", "15coor", "16coor", "17coor", "18coor", "19coor", "20coor",
                 "21coor", "22coor", "23coor", "24coor", "25coor", "26coor", "27coor", "28coor", "29coor", "30coor",
                 "31coor", "32coor", "33coor", "34coor", "35coor", "36coor",
                 "1cross", "2cross", "3cross", "4cross", "5cross", "6cross", "7cross", "8cross", "9cross", "10cross",
-            ]:
-                p = os.path.join(state["run_dir"], fn)
+            ]
+            for fn in key_files:
+                p = os.path.join(run_dir, fn)
                 _show_log(f" - {fn}: {'OK' if os.path.exists(p) else 'MISSING'}")
 
         except Exception as e:
