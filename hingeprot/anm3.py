@@ -333,38 +333,45 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
     if total == 0:
         raise RuntimeError("Eigen file contains no numeric data.")
 
-    # Primary inference: total = k*(nmax+2)  (eigenpairs + eigenvectors)
-    k_total: int | None = None
+    k_total = None
     has_eigpairs = False
+    vec_start = 0
 
-    if total % (nmax + 2) == 0:
-        k_total = total // (nmax + 2)
-        has_eigpairs = True
-        vec_start = 2 * k_total
-    elif total % nmax == 0:
-        # fallback: file has only eigenvectors, no eigenpairs
-        k_total = total // nmax
-        has_eigpairs = False
-        vec_start = 0
-    else:
-        raise RuntimeError(
-            f"Cannot infer k from numeric eigen file. "
-            f"total_floats={total}, nmax={nmax}. "
-            f"Not divisible by (nmax+2)={nmax+2} or nmax={nmax}."
-        )
+    # ---- tolerant inference ----
+    # Preferred: file contains eigenpairs (2 floats per mode) + eigenvectors (nmax floats per mode)
+    # Total should be k*(nmax+2), but some writers add a tiny footer (e.g., +2 floats).
+    if total >= (nmax + 2):
+        k_floor = total // (nmax + 2)
+        rem = total - k_floor * (nmax + 2)
+
+        # accept small remainder (common: rem=2)
+        if k_floor >= 1 and rem <= 32:
+            k_total = int(k_floor)
+            has_eigpairs = True
+            vec_start = 2 * k_total
+
+    # Fallback: maybe vectors only (no eigenpairs), allow small remainder too
+    if k_total is None and total >= nmax:
+        k_floor = total // nmax
+        rem = total - k_floor * nmax
+        if k_floor >= 1 and rem <= 32:
+            k_total = int(k_floor)
+            has_eigpairs = False
+            vec_start = 0
 
     if k_total is None or k_total <= 0:
-        raise RuntimeError(f"Inferred invalid k_total={k_total} from numeric eigen file.")
+        raise RuntimeError(
+            f"Cannot infer k from numeric eigen file. total_floats={total}, nmax={nmax}. "
+            f"Try checking upperhessian.vwmatrix formatting."
+        )
 
     # Extract eigenvalues (if present)
-    eigvals: list[float]
     if has_eigpairs:
-        # file stores pairs: (lambda, residual/0)
         eigvals = [float(all_floats[2*i]) for i in range(k_total)]
     else:
         eigvals = [0.0] * k_total
 
-    # Extract eigenvector floats
+    # Extract eigenvector floats (IGNORE any trailing extras beyond what we need)
     need_vec = nmax * k_total
     vec_floats = all_floats[vec_start:vec_start + need_vec]
     if len(vec_floats) < need_vec:
