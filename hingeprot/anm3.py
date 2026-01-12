@@ -304,14 +304,13 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
 
         return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=n_modes)
 
-    # ---------- numeric "vwmatrix" parser ----------
+    # ---------- numeric "vwmatrix" parser (useblz.py output) ----------
     if nmax_expected is None or nmax_expected <= 0:
         raise RuntimeError(
             "Numeric eigen format detected, but nmax_expected was not provided. "
             "Pass nmax_expected=3*n_residues from alpha.cor."
         )
 
-    # Parse floats per line
     def parse_floats(ln: str) -> list[float]:
         out = []
         for tok in ln.strip().split():
@@ -321,79 +320,100 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
                 pass
         return out
 
-    # 1) Read eigenvalue lines at top: consecutive lines with exactly 2 floats
-    eigvals: list[float] = []
-    pos = 0
-    while pos < len(lines):
-        fl = parse_floats(lines[pos])
-        if len(fl) == 2:
-            eigvals.append(fl[0])
-            pos += 1
-        elif len(fl) == 0:
-            pos += 1
-        else:
-            break
-
-    # If none found, fallback: infer k from remaining float count
-    # (rare, but keeps it robust)
-    remaining_lines = lines[pos:]
-    remaining_floats: list[float] = []
-    first_vec_line_float_count: int | None = None
-    for ln in remaining_lines:
+    # Flatten ALL floats in file (robust: does NOT assume eigenvalue section line structure)
+    all_floats: list[float] = []
+    floats_per_line: list[int] = []
+    for ln in lines:
         fl = parse_floats(ln)
-        if fl:
-            if first_vec_line_float_count is None:
-                first_vec_line_float_count = len(fl)
-            remaining_floats.extend(fl)
+        floats_per_line.append(len(fl))
+        all_floats.extend(fl)
 
-    if not eigvals:
-        # infer k
-        if len(remaining_floats) < nmax_expected:
-            raise RuntimeError(
-                f"Could not find eigenvalues and not enough data for eigenvectors. "
-                f"Need at least {nmax_expected} floats, got {len(remaining_floats)}."
-            )
-        k_total = len(remaining_floats) // nmax_expected
-        eigvals = [0.0] * k_total
+    nmax = int(nmax_expected)
+    total = len(all_floats)
+    if total == 0:
+        raise RuntimeError("Eigen file contains no numeric data.")
+
+    # Primary inference: total = k*(nmax+2)  (eigenpairs + eigenvectors)
+    k_total: int | None = None
+    has_eigpairs = False
+
+    if total % (nmax + 2) == 0:
+        k_total = total // (nmax + 2)
+        has_eigpairs = True
+        vec_start = 2 * k_total
+    elif total % nmax == 0:
+        # fallback: file has only eigenvectors, no eigenpairs
+        k_total = total // nmax
+        has_eigpairs = False
+        vec_start = 0
     else:
-        k_total = len(eigvals)
-
-    if k_total < 16:
-        raise RuntimeError(f"Only {k_total} modes found; need at least 16 for k1=7..k10=16 outputs.")
-
-    need = nmax_expected * k_total
-    if len(remaining_floats) < need:
         raise RuntimeError(
-            f"Eigenvector data too short. Need {need} floats (=nmax*k), got {len(remaining_floats)}."
+            f"Cannot infer k from numeric eigen file. "
+            f"total_floats={total}, nmax={nmax}. "
+            f"Not divisible by (nmax+2)={nmax+2} or nmax={nmax}."
         )
 
-    modes_to_read = min(max_modes, k_total)
-    nmax = nmax_expected
-    jres = nmax // 3
+    if k_total is None or k_total <= 0:
+        raise RuntimeError(f"Inferred invalid k_total={k_total} from numeric eigen file.")
 
-    # Decide layout:
-    # - If first vector line has exactly k_total floats -> likely row-major (each row: all modes)
-    # - Otherwise -> assume column-major (all components of mode1, then mode2, etc.)
-    row_major = (first_vec_line_float_count == k_total)
+    # Extract eigenvalues (if present)
+    eigvals: list[float]
+    if has_eigpairs:
+        # file stores pairs: (lambda, residual/0)
+        eigvals = [float(all_floats[2*i]) for i in range(k_total)]
+    else:
+        eigvals = [0.0] * k_total
+
+    # Extract eigenvector floats
+    need_vec = nmax * k_total
+    vec_floats = all_floats[vec_start:vec_start + need_vec]
+    if len(vec_floats) < need_vec:
+        raise RuntimeError(
+            f"Eigenvector data too short. Need {need_vec} floats (=nmax*k), got {len(vec_floats)}. "
+            f"(nmax={nmax}, k={k_total}, vec_start={vec_start}, total_floats={total})"
+        )
+
+    # Build candidate matrices (nmax x k_total) in two plausible orderings:
+    #  - Row-major: rows are DOFs, columns are modes (common text dump)
+    #  - Column-major: all components of mode1, then mode2, ... (Fortran-ish)
+    V_row = np.array(vec_floats, dtype=float).reshape((nmax, k_total), order="C")
+    V_col = np.array(vec_floats, dtype=float).reshape((k_total, nmax), order="C").T
+
+    def score_matrix(V: np.ndarray) -> float:
+        # lower is better
+        m = min(10, V.shape[1])
+        X = V[:, :m]
+
+        norms = np.linalg.norm(X, axis=0)
+        norm_err = float(np.mean(np.abs(norms - 1.0)))
+
+        # orthogonality error (normalized Gram off-diagonal)
+        # avoid divide-by-zero
+        norms_safe = np.where(norms == 0.0, 1.0, norms)
+        Xn = X / norms_safe
+        G = Xn.T @ Xn
+        off = G - np.eye(m)
+        ortho_err = float(np.mean(np.abs(off)))
+
+        return norm_err + ortho_err
+
+    # Choose the interpretation that looks more like normalized orthogonal eigenvectors
+    s_row = score_matrix(V_row)
+    s_col = score_matrix(V_col)
+    V_best = V_row if s_row <= s_col else V_col
+
+    modes_to_read = min(max_modes, k_total)
 
     w1 = np.zeros(max_modes + 1, dtype=float)
     for i in range(1, modes_to_read + 1):
         w1[i] = float(eigvals[i - 1])
 
     v1 = np.zeros((nmax + 1, max_modes + 1), dtype=float)
+    for m in range(1, modes_to_read + 1):
+        v1[1:nmax + 1, m] = V_best[:, m - 1]
 
-    if row_major:
-        mat = np.array(remaining_floats[:need], dtype=float).reshape((nmax, k_total))
-        for m in range(1, modes_to_read + 1):
-            v1[1:nmax + 1, m] = mat[:, m - 1]
-    else:
-        # column-major
-        for m in range(1, modes_to_read + 1):
-            start = (m - 1) * nmax
-            v1[1:nmax + 1, m] = remaining_floats[start:start + nmax]
-
+    jres = nmax // 3
     return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=modes_to_read)
-
 
 
 def write_eigenanm(outdir: str, eig: EigenData) -> None:
