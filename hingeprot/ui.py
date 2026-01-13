@@ -7,6 +7,9 @@ import subprocess
 import datetime
 import base64
 import uuid
+import shutil
+import glob
+import zipfile
 
 import requests
 import ipywidgets as W
@@ -25,7 +28,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     READ_PY      = os.path.join(HINGEPROT_DIR, "read.py")
     GNM_PY       = os.path.join(HINGEPROT_DIR, "gnm.py")
     ANM2_PY      = os.path.join(HINGEPROT_DIR, "anm2.py")
-    USEBLZ_PY    = os.path.join(HINGEPROT_DIR, "useblz.py")      # k=38, sigma=eps internally
+    USEBLZ_PY    = os.path.join(HINGEPROT_DIR, "useblz.py")      # 36 positive eigenpairs -> upperhessian.vwmatrixd
     ANM3_PY      = os.path.join(HINGEPROT_DIR, "anm3.py")        # postprocess eigenvectors -> *coor/*cross/newcoordinat
     EXTRACT_PY   = os.path.join(HINGEPROT_DIR, "extract.py")     # extract.f port -> hinges, mapping, coor*.mds12
     COOR2PDB_PY  = os.path.join(HINGEPROT_DIR, "coor2pdb.py")    # coor2pdb.f port -> 1anm.pdb..36anm.pdb (+ mod1/mod2)
@@ -364,6 +367,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         "chain_cbs": {},          # dict[str, Checkbox]
         "manual_selection": (),   # last non-all selection
         "_syncing": False,
+        "pdb_tag": None,          # used for renaming outputs
     }
 
     def _show_log(msg: str):
@@ -540,6 +544,15 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             state["pdb_path"] = pdb_path
             _show_log(f"Input PDB saved: {pdb_path} (size={os.path.getsize(pdb_path)} bytes)")
 
+            # --- derive tag for renaming (like $pdbCode in Fortran scripts) ---
+            if input_mode.value == "code":
+                tag = pdb_code.value.strip().upper()
+            else:
+                base = os.path.splitext(os.path.basename(state.get("upload_name") or "UPLOAD"))[0]
+                tag = re.sub(r"[^0-9A-Za-z]+", "", base).upper() or "UPLOAD"
+            state["pdb_tag"] = tag
+            _show_log(f"Output tag (rename prefix): {tag}")
+
             chs = _detect_chains(pdb_path)
             if not chs:
                 raise RuntimeError("No chains detected in the PDB.")
@@ -657,7 +670,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
 
             _show_log("Solving eigenproblem with useblz.py (36 positive eigenpairs; writes upperhessian.vwmatrixd)...")
-            _run(["python3", USEBLZ_PY, "upperhessian"], cwd=run_dir, title="useblz.py")
+            _run(["python3", USEBLZ_PY, "upperhessian", "--out", "upperhessian.vwmatrixd"], cwd=run_dir, title="useblz.py")
             progress.value += 1
 
             out_vw = os.path.join(run_dir, "upperhessian.vwmatrixd")
@@ -678,7 +691,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _show_log("anm3.py postprocess done: wrote newcoordinat.mds, eigenanm, *coor, *cross")
 
             # ---- run extract.py ----
-            # extract.py needs: coordinates, alpha.cor, slowmodes, crosscorrslow1, crosscorrslow2, 1coor..10coor, newcoordinat.mds
             _require_files(run_dir, ["coordinates", "alpha.cor", "slowmodes"], "extract.py precheck")
             _require_files(run_dir, ["crosscorrslow1", "crosscorrslow2"], "extract.py precheck")
             _require_files(run_dir, ["newcoordinat.mds"], "extract.py precheck")
@@ -693,9 +705,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _show_log("extract.py done: wrote hinges, mapping.out, anm_length, coor*.mds12, gnm*anmvector")
 
             # ---- run coor2pdb.py ----
-            # coor2pdb.py expects to read 'pdb' and the coor files in the current run_dir.
-            # It writes: mod1, mod2, and 1anm.pdb..36anm.pdb
-            # If your coor2pdb.py accepts args, adjust the command here accordingly.
             _require_files(run_dir, ["pdb"], "coor2pdb.py precheck")
             _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "coor2pdb.py precheck")
             _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "coor2pdb.py precheck")
@@ -703,42 +712,122 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _run(["python3", COOR2PDB_PY], cwd=run_dir, title="coor2pdb.py")
             progress.value += 1
 
-            # Basic output check
             one_anm = os.path.join(run_dir, "1anm.pdb")
             if not os.path.exists(one_anm) or os.path.getsize(one_anm) == 0:
                 raise RuntimeError("coor2pdb.py did not produce 1anm.pdb (missing/empty).")
             _show_log("coor2pdb.py done: wrote mod1/mod2 and 1anm.pdb..36anm.pdb")
 
+            # ---------- FINALIZE: rename outputs and create zip archives ----------
+            tag = state.get("pdb_tag") or "RUN"
+
+            def _safe_rename(src: str, dst: str):
+                sp = os.path.join(run_dir, src)
+                dp = os.path.join(run_dir, dst)
+                if not os.path.exists(sp):
+                    _show_log(f"rename skip (missing): {src}")
+                    return
+                try:
+                    if os.path.exists(dp):
+                        os.remove(dp)
+                    shutil.move(sp, dp)
+                    _show_log(f"renamed: {src} -> {dst}")
+                except Exception as e:
+                    _show_log(f"rename failed: {src} -> {dst} ({e})")
+
+            def _zip_make(zip_name: str, rel_files: list[str]):
+                zp = os.path.join(run_dir, zip_name)
+                files_ok = []
+                for rf in rel_files:
+                    fp = os.path.join(run_dir, rf)
+                    if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                        files_ok.append(rf)
+                    else:
+                        _show_log(f"zip skip (missing/empty): {rf}")
+
+                if not files_ok:
+                    _show_log(f"zip not created (no files): {zip_name}")
+                    return
+
+                try:
+                    if os.path.exists(zp):
+                        os.remove(zp)
+                    with zipfile.ZipFile(zp, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+                        for rf in files_ok:
+                            z.write(os.path.join(run_dir, rf), arcname=rf)
+                    _show_log(f"zip created: {zip_name} ({len(files_ok)} files)")
+                except Exception as e:
+                    _show_log(f"zip failed: {zip_name} ({e})")
+
+            _show_log(f"Renaming outputs with prefix: {tag}")
+
+            rename_map = [
+                ("coor1.mds12", f"{tag}.cor1A"),
+                ("coor2.mds12", f"{tag}.cor1B"),
+                ("coor3.mds12", f"{tag}.cor2A"),
+                ("coor4.mds12", f"{tag}.cor2B"),
+                ("slowmodes",   f"{tag}.slowmodes"),
+                ("slow12avg",   f"{tag}.slow12avg"),
+                ("crosscorr",   f"{tag}.crosscorr"),
+                ("alpha.cor",   f"{tag}.CA"),
+                ("gnm1anmvector",  f"{tag}.1vector"),
+                ("gnm2anmvector",  f"{tag}.2vector"),
+                ("hinges",         f"{tag}.hinge"),
+                ("crosscorrslow1", f"{tag}.crossslow1"),
+                ("crosscorrslow2", f"{tag}.crossslow2"),
+                ("newcoordinat.mds", f"{tag}.new"),
+                ("anm_length",       f"{tag}.anm1D"),
+                ("mod1",             f"{tag}.modeanimation1"),
+                ("mod2",             f"{tag}.modeanimation2"),
+            ]
+
+            for k in range(1, 37):
+                rename_map.append((f"{k}coor", f"{tag}.anm{k}vector"))
+
+            for src, dst in rename_map:
+                _safe_rename(src, dst)
+
+            # zip ANM-MSF.zip $pdbCode.anm?vector $pdbCode.anm10vector  => anm1..anm10
+            anm_msf = [f"{tag}.anm{k}vector" for k in range(1, 11)]
+            _zip_make("ANM-MSF.zip", anm_msf)
+
+            # zip ANM-MSFa.zip $pdbCode.anm*vector => anm1..anm36
+            anm_msfa = [f"{tag}.anm{k}vector" for k in range(1, 37)]
+            _zip_make("ANM-MSFa.zip", anm_msfa)
+
+            # zip anm136.zip *anm.pdb (we do NOT rename these PDBs)
+            anm_pdbs = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "*anm.pdb")))]
+            _zip_make("anm136.zip", anm_pdbs)
+
             # ---- finalize ----
             progress.value = progress.max
             progress.bar_style = "success"
 
-            _show_log("Done. Key files in run folder:")
+            _show_log("Done. Key files in run folder (after rename/zip):")
             key_files = [
-                # inputs / preprocessing
-                "pdb", "alpha.cor", "coordinates",
+                # core inputs / outputs that remain
+                "pdb", "coordinates",
                 "gnmcutoff", "anmcutoff", "rescale",
-
-                # gnm
-                "sortedeigen", "sloweigenvectors", "slowmodes", "slow12avg", "crosscorr",
-                "crosscorrslow1", "crosscorrslow2", "crosscorrslow1ext",
-
-                # anm
                 "upperhessian", "upperhessian.vwmatrixd",
-                "eigenanm", "newcoordinat.mds",
 
-                # extract outputs
-                "anm_length", "newcoordinat2.mds", "mapping.out", "hinges",
-                "coor1.mds12", "coor2.mds12", "coor3.mds12", "coor4.mds12",
-                "gnm1anmvector", "gnm2anmvector",
+                # renamed “tagged” outputs
+                f"{tag}.CA",
+                f"{tag}.slowmodes", f"{tag}.slow12avg", f"{tag}.crosscorr",
+                f"{tag}.crossslow1", f"{tag}.crossslow2",
+                f"{tag}.hinge",
+                f"{tag}.new",
+                f"{tag}.anm1D",
+                f"{tag}.1vector", f"{tag}.2vector",
+                f"{tag}.cor1A", f"{tag}.cor1B", f"{tag}.cor2A", f"{tag}.cor2B",
+                *[f"{tag}.anm{k}vector" for k in range(1, 37)],
 
-                # anm3 outputs (coor + cross)
-                *[f"{k}coor" for k in range(1, 37)],
-                *[f"{k}cross" for k in range(1, 11)],
+                # zips
+                "ANM-MSF.zip", "ANM-MSFa.zip", "anm136.zip",
 
-                # coor2pdb outputs
-                "mod1", "mod2",
+                # pdb outputs
                 *[f"{k}anm.pdb" for k in range(1, 37)],
+                # mode animations (renamed)
+                f"{tag}.modeanimation1",
+                f"{tag}.modeanimation2",
             ]
             _show_file_sizes(run_dir, key_files)
 
@@ -757,6 +846,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         state["chain_cbs"] = {}
         state["manual_selection"] = ()
         state["_syncing"] = False
+        state["pdb_tag"] = None
 
         all_chains.value = False
         chains_wrap.children = ()
