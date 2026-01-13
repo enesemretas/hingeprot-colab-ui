@@ -151,7 +151,7 @@ def build_sparse_upper_hessian(
     return acc
 
 
-ddef write_upperhessian(
+def write_upperhessian(
     sparse_upper: dict[tuple[int, int], float],
     outpath: str | Path,
     tol: float = 0.0
