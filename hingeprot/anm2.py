@@ -151,38 +151,53 @@ def build_sparse_upper_hessian(
     return acc
 
 
-def write_upperhessian(
+ddef write_upperhessian(
     sparse_upper: dict[tuple[int, int], float],
     outpath: str | Path,
     tol: float = 0.0
 ) -> None:
     """
-    Output format:
-      - no leading spaces
-      - exactly ONE space between tokens
-      - NEVER scientific notation (no E-notation)
+    Fortran-style spacing & formatting (as requested):
 
-    Values are written in fixed-point (decimal) form, then trimmed.
+      - Each line starts with ONE leading space
+      - Between col1 and col2: ONE space
+      - Between col2 and col3:
+          * TWO spaces if value >= 0
+          * ONE space  if value < 0
+      - Col3 uses 9 significant digits
+      - If |value| < 1e-4 => scientific notation (E) (still 9 significant digits)
+
+    Example:
+      " 98365"
+      " 1 1  1.53889489"
+      " 1 2 -0.01368468"
+      " 1 3  3.30213541E-07"
     """
     items = [((i, j), v) for (i, j), v in sparse_upper.items() if abs(v) > tol]
     items.sort(key=lambda t: (t[0][0], t[0][1]))
 
-    def fmt_no_sci(x: float, decimals: int = 10) -> str:
-        # fixed-point, then trim trailing zeros and dot
-        s = f"{x:.{decimals}f}"
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
-        # avoid "-0"
-        if s == "-0":
-            s = "0"
-        return s
+    def fmt_9sig(v: float) -> str:
+        if v == 0.0:
+            return "0"
+        av = abs(v)
+        if av < 1e-4:
+            # 9 significant digits => 1 digit before dot + 8 after, with E exponent
+            return f"{v:.8E}"
+        # general (non-scientific) with 9 significant digits
+        return f"{v:.9G}"
 
     out = Path(outpath)
     with out.open("w", encoding="utf-8") as f:
-        f.write(f"{len(items)}\n")
+        # first line: also starts with ONE leading space
+        f.write(f" {len(items)}\n")
+
         for (i, j), v in items:
-            vstr = fmt_no_sci(float(v), decimals=10)
-            f.write(f"{i+1} {j+1} {vstr}\n")
+            vstr = fmt_9sig(float(v)).replace("D", "E")
+            sep23 = "  " if float(v) >= 0.0 else " "
+            # NOTE: exactly one leading space at start of line
+            #       exactly ONE space between col1 & col2
+            f.write(f" {i+1} {j+1}{sep23}{vstr}\n")
+
 
 
 
