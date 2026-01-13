@@ -243,12 +243,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         """
         candidates = [
             os.path.join(run_dir, f"{tag}.new.hinges"),
-            os.path.join(run_dir, f"{tag}.hinges"),
-            os.path.join(run_dir, "hinges"),
+            os.path.join(run_dir, f"{tag}.hinge"),
+            os.path.join(run_dir, "hinge"),
         ]
         fp = next((p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 0), None)
         if not fp:
-            return "Hinge fractions file not found (expected: TAG.new.hinges)."
+            return "Hinge fractions file not found (expected: PDB_ID.new.hinges)."
 
         keep = []
         with open(fp, "r", encoding="utf-8", errors="ignore") as f:
