@@ -33,9 +33,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     EXTRACT_PY       = os.path.join(HINGEPROT_DIR, "extract.py")       # extract.f port -> hinges, mapping, coor*.mds12
     COOR2PDB_PY      = os.path.join(HINGEPROT_DIR, "coor2pdb.py")      # coor2pdb.f port -> 1anm.pdb..36anm.pdb (+ mod1/mod2)
 
-    # NEW: processHinges + splitter (python ports)
+    # Optional: python ports (you said you created splitter.py and plan processHinges.py + hingeaa.py)
     PROCESSHINGES_PY = os.path.join(HINGEPROT_DIR, "processHinges.py")
     SPLITTER_PY      = os.path.join(HINGEPROT_DIR, "splitter.py")
+    HINGEAA_PY       = os.path.join(HINGEPROT_DIR, "hingeaa.py")
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -77,7 +78,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             else:
                 _show_log(f" - {fn}: MISSING")
 
-    def _run(cmd: list[str], cwd: str, title: str):
+    def _run(cmd: list[str], cwd: str, title: str, allow_fail: bool = False):
         _show_log(f"Running: {' '.join(cmd)}")
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
         if proc.stdout and proc.stdout.strip():
@@ -85,7 +86,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         if proc.stderr and proc.stderr.strip():
             _show_log(proc.stderr.rstrip())
         if proc.returncode != 0:
-            raise RuntimeError(f"{title} failed (return code {proc.returncode}).")
+            msg = f"{title} failed (return code {proc.returncode})."
+            if allow_fail:
+                _show_log("WARNING: " + msg)
+                return proc
+            raise RuntimeError(msg)
         return proc
 
     def _require_files(run_dir: str, relpaths: list[str], step_name: str):
@@ -101,9 +106,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         keep_only_first_model: bool = True,
     ) -> dict:
         """
-        Preprocess (MATLAB logic adapted to raw PDB text):
-
-        - Keep ONLY first MODEL block (if present) else all.
+        - Keep ONLY first MODEL block (if present)
         - Keep only ATOM (and optionally TER). Drop HETATM and everything else.
         - altLoc: keep if blank or 'A'
         - iCode : keep if blank
@@ -133,7 +136,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 stats["lines_read"] += 1
                 rec = line[:6]
 
-                # MODEL logic: keep only first MODEL block (if present)
                 if keep_only_first_model:
                     if rec == "MODEL ":
                         if not model_found:
@@ -154,16 +156,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     if model_done:
                         continue
 
-                    # If MODEL exists, ignore anything outside the first MODEL
                     if model_found and not in_model:
                         continue
 
-                # Drop HETATM
                 if rec == "HETATM":
                     stats["hetatm_skipped"] += 1
                     continue
 
-                # TER optional
                 if rec == "TER   ":
                     if not keep_ter:
                         stats["nonatom_skipped"] += 1
@@ -178,12 +177,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     stats["ter_written"] += 1
                     continue
 
-                # Keep only ATOM
                 if rec != "ATOM  ":
                     stats["nonatom_skipped"] += 1
                     continue
 
-                # chain filter
                 if chains_keep is not None:
                     if len(line) <= 21:
                         stats["chain_skipped"] += 1
@@ -193,13 +190,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         stats["chain_skipped"] += 1
                         continue
 
-                # altLoc filter (col 17 => index 16)
                 altloc = line[16] if len(line) > 16 else " "
                 if altloc not in (" ", "A"):
                     stats["altloc_skipped"] += 1
                     continue
 
-                # iCode filter (col 27 => index 26)
                 icode = line[26] if len(line) > 26 else " "
                 if icode != " ":
                     stats["icode_skipped"] += 1
@@ -368,10 +363,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         "upload_name": None,
         "upload_bytes": None,
         "detected_chains": [],
-        "chain_cbs": {},          # dict[str, Checkbox]
-        "manual_selection": (),   # last non-all selection
+        "chain_cbs": {},
+        "manual_selection": (),
         "_syncing": False,
-        "pdb_tag": None,          # used for renaming outputs
+        "pdb_tag": None,
     }
 
     def _show_log(msg: str):
@@ -389,7 +384,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     _sync_input_visibility()
     input_mode.observe(lambda ch: _sync_input_visibility(), names="value")
 
-    # uploader callback (unique)
+    # uploader callback
     cb_name = f"hingeprot_uploader_{uuid.uuid4().hex}"
 
     def _js_upload_callback(payload):
@@ -548,7 +543,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             state["pdb_path"] = pdb_path
             _show_log(f"Input PDB saved: {pdb_path} (size={os.path.getsize(pdb_path)} bytes)")
 
-            # --- derive tag for renaming (like $pdbCode in Fortran scripts) ---
+            # tag like $pdbCode
             if input_mode.value == "code":
                 tag = pdb_code.value.strip().upper()
             else:
@@ -585,6 +580,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not state["pdb_path"] or not os.path.exists(state["pdb_path"]):
                 raise RuntimeError("Please click 'Load / Detect Chains' first.")
 
+            # Required scripts
             for p, name in [
                 (READ_PY, "read.py"),
                 (GNM_PY, "gnm.py"),
@@ -593,8 +589,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 (ANM3_PY, "anm3.py"),
                 (EXTRACT_PY, "extract.py"),
                 (COOR2PDB_PY, "coor2pdb.py"),
-                (PROCESSHINGES_PY, "processHinges.py"),
-                (SPLITTER_PY, "splitter.py"),
             ]:
                 if not os.path.exists(p):
                     raise RuntimeError(f"{name} not found at: {p}")
@@ -617,110 +611,22 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             anm_val = float(get_anm_cut())
             rescale_val = float(get_rescale())
 
-            progress.max = 10
+            # steps:
+            # 1 params, 2 preprocess, 3 read, 4 gnm, 5 anm2, 6 useblz, 7 anm3,
+            # 8 extract, 9 coor2pdb, 10 rename+zips, 11 processHinges+hingeaa+splitter, 12 done
+            progress.max = 12
             progress.value = 0
             progress.bar_style = "info"
 
             run_dir = state["run_dir"]
-            _show_log(f"Run folder: {run_dir}")
-            _show_log(f"Selected chains: {(chain_str if not all_chains.value else 'ALL')}")
-
-            _write_text(os.path.join(run_dir, "gnmcutoff"), gnm_val)
-            _write_text(os.path.join(run_dir, "anmcutoff"), anm_val)
-            _write_text(os.path.join(run_dir, "rescale"), rescale_val)  # used by extract.py
-            progress.value += 1
-            _show_log("Parameters written: gnmcutoff / anmcutoff / rescale")
-
-            pdb_out = os.path.join(run_dir, "pdb")
-            stats = _preprocess_pdb(
-                pdb_in=state["pdb_path"],
-                pdb_out=pdb_out,
-                chains_keep=chains_keep,
-                keep_ter=True,
-                keep_only_first_model=True,
-            )
-            progress.value += 1
-            _show_log("Preprocess done. Output written as 'pdb'.")
-            _show_log(
-                f"Stats: atom_written={stats['atom_written']}, ter_written={stats['ter_written']}, "
-                f"altloc_skipped={stats['altloc_skipped']}, icode_skipped={stats['icode_skipped']}, "
-                f"chain_skipped={stats['chain_skipped']}, hetatm_skipped={stats['hetatm_skipped']}, "
-                f"used_model_block={stats['used_model_block']}"
-            )
-
-            if not os.path.exists(pdb_out) or os.path.getsize(pdb_out) == 0:
-                raise RuntimeError("Preprocess produced empty 'pdb'. Check chain selection / filters.")
-
-            _run(["python3", READ_PY, "pdb", "alpha.cor", "coordinates"], cwd=run_dir, title="read.py")
-            progress.value += 1
-
-            _run(
-                ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"],
-                cwd=run_dir,
-                title="gnm.py",
-            )
-            progress.value += 1
-
-            _run(
-                ["python3", ANM2_PY, "--alpha", "alpha.cor", "--cutoff", "anmcutoff", "--out", "upperhessian"],
-                cwd=run_dir,
-                title="anm2.py",
-            )
-            progress.value += 1
-
-            upper_path = os.path.join(run_dir, "upperhessian")
-            if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
-                raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
-
-            _show_log("Solving eigenproblem with useblz.py (36 positive eigenpairs; writes upperhessian.vwmatrixd)...")
-            _run(["python3", USEBLZ_PY, "upperhessian", "--out", "upperhessian.vwmatrixd"], cwd=run_dir, title="useblz.py")
-            progress.value += 1
-
-            out_vw = os.path.join(run_dir, "upperhessian.vwmatrixd")
-            if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
-                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrixd (missing/empty).")
-            _show_log(f"Eigen solve done. Wrote: {out_vw}")
-
-            _run(
-                ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrixd", "--outdir", "."],
-                cwd=run_dir,
-                title="anm3.py",
-            )
-            progress.value += 1
-
-            _require_files(run_dir, ["newcoordinat.mds"], "anm3.py postcheck")
-            _require_files(run_dir, [f"{k}coor" for k in range(1, 11)], "anm3.py postcheck")
-            _show_log("anm3.py postprocess done: wrote newcoordinat.mds, eigenanm, *coor, *cross")
-
-            _require_files(run_dir, ["coordinates", "alpha.cor", "slowmodes"], "extract.py precheck")
-            _require_files(run_dir, ["crosscorrslow1", "crosscorrslow2"], "extract.py precheck")
-            _require_files(run_dir, ["newcoordinat.mds"], "extract.py precheck")
-            _require_files(run_dir, [f"{k}coor" for k in range(1, 11)], "extract.py precheck")
-
-            _run(["python3", EXTRACT_PY], cwd=run_dir, title="extract.py")
-            progress.value += 1
-
-            hinges_path = os.path.join(run_dir, "hinges")
-            if not os.path.exists(hinges_path) or os.path.getsize(hinges_path) == 0:
-                raise RuntimeError("extract.py did not produce hinges (missing/empty).")
-            _show_log("extract.py done: wrote hinges, mapping.out, anm_length, coor*.mds12, gnm*anmvector")
-
-            _require_files(run_dir, ["pdb"], "coor2pdb.py precheck")
-            _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "coor2pdb.py precheck")
-            _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "coor2pdb.py precheck")
-
-            _run(["python3", COOR2PDB_PY], cwd=run_dir, title="coor2pdb.py")
-            progress.value += 1
-
-            one_anm = os.path.join(run_dir, "1anm.pdb")
-            if not os.path.exists(one_anm) or os.path.getsize(one_anm) == 0:
-                raise RuntimeError("coor2pdb.py did not produce 1anm.pdb (missing/empty).")
-            _show_log("coor2pdb.py done: wrote mod1/mod2 and 1anm.pdb..36anm.pdb")
-
-            # ---------- FINALIZE: rename outputs and create zip archives ----------
             tag = state.get("pdb_tag") or "RUN"
 
-            def _safe_rename(src: str, dst: str):
+            _show_log(f"Run folder: {run_dir}")
+            _show_log(f"Selected chains: {(chain_str if not all_chains.value else 'ALL')}")
+            _show_log(f"Tag: {tag}")
+
+            # --------- small helpers inside run ----------
+            def _safe_rename(src: str, dst: str) -> bool:
                 sp = os.path.join(run_dir, src)
                 dp = os.path.join(run_dir, dst)
                 if not os.path.exists(sp):
@@ -736,7 +642,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     _show_log(f"rename failed: {src} -> {dst} ({e})")
                     return False
 
-            def _safe_rename_any(src_candidates: list[str], dst: str):
+            def _safe_rename_any(src_candidates: list[str], dst: str) -> bool:
                 for s in src_candidates:
                     if os.path.exists(os.path.join(run_dir, s)):
                         return _safe_rename(s, dst)
@@ -767,6 +673,115 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 except Exception as e:
                     _show_log(f"zip failed: {zip_name} ({e})")
 
+            def _moved1_candidates():
+                return [f"{tag}.new.moved1.pdb", f"{tag}.new.moved1.pdb.pdb", "new.moved1.pdb", "new.moved1.pdb.pdb"]
+
+            def _moved2_candidates():
+                return [f"{tag}.new.moved2.pdb", f"{tag}.new.moved2.pdb.pdb", "new.moved2.pdb", "new.moved2.pdb.pdb"]
+
+            def _loops_candidates():
+                return [f"{tag}.new.loops", "new.loops", f"{tag}.new.loops.txt", "new.loops.txt"]
+
+            # ---------- Step 1: params ----------
+            _write_text(os.path.join(run_dir, "gnmcutoff"), gnm_val)
+            _write_text(os.path.join(run_dir, "anmcutoff"), anm_val)
+            _write_text(os.path.join(run_dir, "rescale"), rescale_val)
+            progress.value += 1
+            _show_log("Parameters written: gnmcutoff / anmcutoff / rescale")
+
+            # ---------- Step 2: preprocess ----------
+            pdb_out = os.path.join(run_dir, "pdb")
+            stats = _preprocess_pdb(
+                pdb_in=state["pdb_path"],
+                pdb_out=pdb_out,
+                chains_keep=chains_keep,
+                keep_ter=True,
+                keep_only_first_model=True,
+            )
+            progress.value += 1
+            _show_log("Preprocess done. Output written as 'pdb'.")
+            _show_log(
+                f"Stats: atom_written={stats['atom_written']}, ter_written={stats['ter_written']}, "
+                f"altloc_skipped={stats['altloc_skipped']}, icode_skipped={stats['icode_skipped']}, "
+                f"chain_skipped={stats['chain_skipped']}, hetatm_skipped={stats['hetatm_skipped']}, "
+                f"used_model_block={stats['used_model_block']}"
+            )
+            if not os.path.exists(pdb_out) or os.path.getsize(pdb_out) == 0:
+                raise RuntimeError("Preprocess produced empty 'pdb'. Check chain selection / filters.")
+
+            # ---------- Step 3: read.py ----------
+            _run(["python3", READ_PY, "pdb", "alpha.cor", "coordinates"], cwd=run_dir, title="read.py")
+            progress.value += 1
+
+            # ---------- Step 4: gnm.py ----------
+            _run(
+                ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"],
+                cwd=run_dir,
+                title="gnm.py",
+            )
+            progress.value += 1
+
+            # ---------- Step 5: anm2.py ----------
+            _run(
+                ["python3", ANM2_PY, "--alpha", "alpha.cor", "--cutoff", "anmcutoff", "--out", "upperhessian"],
+                cwd=run_dir,
+                title="anm2.py",
+            )
+            progress.value += 1
+
+            upper_path = os.path.join(run_dir, "upperhessian")
+            if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
+                raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
+
+            # ---------- Step 6: useblz.py ----------
+            _show_log("Solving eigenproblem with useblz.py (36 positive eigenpairs; writes upperhessian.vwmatrixd)...")
+            _run(["python3", USEBLZ_PY, "upperhessian", "--out", "upperhessian.vwmatrixd"], cwd=run_dir, title="useblz.py")
+            progress.value += 1
+
+            out_vw = os.path.join(run_dir, "upperhessian.vwmatrixd")
+            if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
+                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrixd (missing/empty).")
+
+            # ---------- Step 7: anm3.py ----------
+            _run(
+                ["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrixd", "--outdir", "."],
+                cwd=run_dir,
+                title="anm3.py",
+            )
+            progress.value += 1
+
+            _require_files(run_dir, ["newcoordinat.mds"], "anm3.py postcheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 11)], "anm3.py postcheck")
+            _show_log("anm3.py postprocess done: wrote newcoordinat.mds, eigenanm, *coor, *cross")
+
+            # ---------- Step 8: extract.py ----------
+            _require_files(run_dir, ["coordinates", "alpha.cor", "slowmodes"], "extract.py precheck")
+            _require_files(run_dir, ["crosscorrslow1", "crosscorrslow2"], "extract.py precheck")
+            _require_files(run_dir, ["newcoordinat.mds"], "extract.py precheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 11)], "extract.py precheck")
+
+            _run(["python3", EXTRACT_PY], cwd=run_dir, title="extract.py")
+            progress.value += 1
+
+            hinges_path = os.path.join(run_dir, "hinges")
+            if not os.path.exists(hinges_path) or os.path.getsize(hinges_path) == 0:
+                raise RuntimeError("extract.py did not produce hinges (missing/empty).")
+            _show_log("extract.py done: wrote hinges, mapping.out, anm_length, coor*.mds12, gnm*anmvector")
+
+            # ---------- Step 9: coor2pdb.py ----------
+            _require_files(run_dir, ["pdb"], "coor2pdb.py precheck")
+            _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "coor2pdb.py precheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "coor2pdb.py precheck")
+
+            _run(["python3", COOR2PDB_PY], cwd=run_dir, title="coor2pdb.py")
+            progress.value += 1
+
+            one_anm = os.path.join(run_dir, "1anm.pdb")
+            if not os.path.exists(one_anm) or os.path.getsize(one_anm) == 0:
+                raise RuntimeError("coor2pdb.py did not produce 1anm.pdb (missing/empty).")
+            _show_log("coor2pdb.py done: wrote mod1/mod2 and 1anm.pdb..36anm.pdb")
+
+            # ---------- Step 10: rename + zips ----------
             _show_log(f"Renaming outputs with prefix: {tag}")
 
             rename_map = [
@@ -790,75 +805,85 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 ("sortedeigen",      f"{tag}.eigengnm"),
                 ("eigenanm",         f"{tag}.eigenanm"),
             ]
-
             for k in range(1, 37):
                 rename_map.append((f"{k}coor", f"{tag}.anm{k}vector"))
 
             for src, dst in rename_map:
                 _safe_rename(src, dst)
 
-            # zip ANM-MSF.zip : anm1..anm10
+            # zips
             anm_msf = [f"{tag}.anm{k}vector" for k in range(1, 11)]
             _zip_make("ANM-MSF.zip", anm_msf)
 
-            # zip ANM-MSFa.zip : anm1..anm36
             anm_msfa = [f"{tag}.anm{k}vector" for k in range(1, 37)]
             _zip_make("ANM-MSFa.zip", anm_msfa)
 
-            # zip anm136.zip : *anm.pdb
             anm_pdbs = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "*anm.pdb")))]
             _zip_make("anm136.zip", anm_pdbs)
 
-            # ---------- NEW: processHinges block (Fortran script equivalent) ----------
+            progress.value += 1
+
+            # ---------- Step 11: processHinges + hingeaa + splitter + panm136.zip ----------
             loop_thr = "15"
             clust_thr = "14.0"
 
-            def _run_processhinges(v1: str, v2: str):
-                _run(
-                    ["python3", PROCESSHINGES_PY, f"{tag}.new", f"{tag}.hinge", v1, v2, loop_thr, clust_thr],
-                    cwd=run_dir,
-                    title="processHinges.py",
-                )
+            if os.path.exists(PROCESSHINGES_PY):
+                def _run_processhinges(v1: str, v2: str):
+                    _run(
+                        ["python3", PROCESSHINGES_PY, f"{tag}.new", f"{tag}.hinge", v1, v2, loop_thr, clust_thr],
+                        cwd=run_dir,
+                        title="processHinges.py",
+                    )
 
-            def _moved1_name():
-                return [f"{tag}.new.moved1.pdb", f"{tag}.new.moved1.pdb.pdb"]
+                _show_log("Running processHinges for ANM mode pairs -> anment*.pdb ...")
+                for i in range(1, 37, 2):
+                    v1 = f"{tag}.anm{i}vector"
+                    v2 = f"{tag}.anm{i+1}vector"
+                    if not os.path.exists(os.path.join(run_dir, v1)) or not os.path.exists(os.path.join(run_dir, v2)):
+                        _show_log(f" processHinges skip pair ({i},{i+1}) missing vectors.")
+                        continue
 
-            def _moved2_name():
-                return [f"{tag}.new.moved2.pdb", f"{tag}.new.moved2.pdb.pdb"]
+                    _show_log(f" processHinges: ({i},{i+1}) using {v1} {v2}")
+                    _run_processhinges(v1, v2)
 
-            def _loops_name():
-                return [f"{tag}.new.loops", f"{tag}.new.loops.txt"]
+                    _safe_rename_any(_moved1_candidates(), f"anment{i}.pdb")
+                    _safe_rename_any(_moved2_candidates(), f"anment{i+1}.pdb")
 
-            _show_log("Running processHinges for ANM mode pairs -> anment*.pdb ...")
+                _show_log("Running processHinges for GNM vectors (1vector/2vector) ...")
+                if os.path.exists(os.path.join(run_dir, f"{tag}.1vector")) and os.path.exists(os.path.join(run_dir, f"{tag}.2vector")):
+                    _run_processhinges(f"{tag}.1vector", f"{tag}.2vector")
+                else:
+                    _show_log(" WARNING: missing tagged GNM vectors; skipping GNM processHinges.")
+            else:
+                _show_log("WARNING: processHinges.py not found; skipping processHinges block.")
 
-            # anm1-2, 3-4, ... 35-36
-            for i in range(1, 37, 2):
-                v1 = f"{tag}.anm{i}vector"
-                v2 = f"{tag}.anm{i+1}vector"
-                _show_log(f" processHinges: ({i},{i+1}) using {v1} {v2}")
-                _run_processhinges(v1, v2)
+            # rename loops -> tag.loops
+            _safe_rename_any(_loops_candidates(), f"{tag}.loops")
 
-                # rename moved outputs to anment{i}, anment{i+1}
-                _safe_rename_any(_moved1_name(), f"anment{i}.pdb")
-                _safe_rename_any(_moved2_name(), f"anment{i+1}.pdb")
+            # hingeaa (ONLY after processHinges, because it expects TAG.new.hinges)
+            if os.path.exists(HINGEAA_PY):
+                hinges_in_rel = f"{tag}.new.hinges"
+                hinges_in = os.path.join(run_dir, hinges_in_rel)
+                if os.path.exists(hinges_in) and os.path.getsize(hinges_in) > 0:
+                    _show_log("Running hingeaa.py to annotate hinge residues with AA codes ...")
+                    # try arg-style; if your hingeaa.py is no-arg style, we fallback
+                    try:
+                        _run(["python3", HINGEAA_PY, hinges_in_rel, "coordinates", "hingeout"], cwd=run_dir, title="hingeaa.py", allow_fail=False)
+                        _safe_rename("hingeout", f"{tag}.hinges")
+                    except Exception as e:
+                        _show_log(f"hingeaa.py (arg-mode) failed: {e}")
+                        _show_log("Trying hingeaa.py with no arguments ...")
+                        _run(["python3", HINGEAA_PY], cwd=run_dir, title="hingeaa.py", allow_fail=True)
+                        if os.path.exists(os.path.join(run_dir, "hingeout")):
+                            _safe_rename("hingeout", f"{tag}.hinges")
+                else:
+                    _show_log(f"hingeaa skip: missing/empty {hinges_in_rel}")
+            else:
+                _show_log("WARNING: hingeaa.py not found; skipping hingeaa.")
 
-            _show_log("Running processHinges for GNM vectors (1vector/2vector) ...")
-            _run_processhinges(f"{tag}.1vector", f"{tag}.2vector")
-
-            # rename loops
-            _safe_rename_any(_loops_name(), f"{tag}.loops")
-
-            # copy moved files to modeent1/modeent2 for splitter
-            moved1 = None
-            moved2 = None
-            for c in _moved1_name():
-                if os.path.exists(os.path.join(run_dir, c)):
-                    moved1 = c
-                    break
-            for c in _moved2_name():
-                if os.path.exists(os.path.join(run_dir, c)):
-                    moved2 = c
-                    break
+            # splitter workflow uses the latest moved1/moved2 after GNM processHinges
+            moved1 = next((c for c in _moved1_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
+            moved2 = next((c for c in _moved2_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
 
             if moved1 and moved2:
                 try:
@@ -868,31 +893,28 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 except Exception as e:
                     _show_log(f"Copy to modeent* failed: {e}")
 
-                # run splitter.py (expects 'pdb' + modeent1/modeent2)
-                try:
-                    _run(["python3", SPLITTER_PY], cwd=run_dir, title="splitter.py")
-                    _show_log("splitter.py done.")
-                except Exception as e:
-                    _show_log(f"splitter.py failed (continuing): {e}")
+                if os.path.exists(SPLITTER_PY):
+                    _run(["python3", SPLITTER_PY], cwd=run_dir, title="splitter.py", allow_fail=True)
+                else:
+                    _show_log("WARNING: splitter.py not found; skipping splitter run.")
 
-                # unlink modeent*
                 for fp in glob.glob(os.path.join(run_dir, "modeent*")):
                     try:
                         os.remove(fp)
                     except Exception:
                         pass
 
-                # rename moved1/moved2 to mode1.ent/mode2.ent
-                _safe_rename_any(_moved1_name(), f"{tag}.mode1.ent")
-                _safe_rename_any(_moved2_name(), f"{tag}.mode2.ent")
+                _safe_rename_any(_moved1_candidates(), f"{tag}.mode1.ent")
+                _safe_rename_any(_moved2_candidates(), f"{tag}.mode2.ent")
             else:
-                _show_log("WARNING: moved1/moved2 not found after GNM processHinges; skipping splitter + mode*.ent.")
+                _show_log("WARNING: moved1/moved2 not found; skipping splitter + mode*.ent rename.")
 
-            # zip panm136.zip anment*
             anment_files = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "anment*.pdb")))]
             _zip_make("panm136.zip", anment_files)
 
-            # ---- finalize ----
+            progress.value += 1
+
+            # ---------- Step 12: done ----------
             progress.value = progress.max
             progress.bar_style = "success"
 
@@ -902,7 +924,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 "gnmcutoff", "anmcutoff", "rescale",
                 "upperhessian", "upperhessian.vwmatrixd",
 
-                # tagged outputs
                 f"{tag}.CA",
                 f"{tag}.slowmodes", f"{tag}.slow12avg", f"{tag}.crosscorr",
                 f"{tag}.crossslow1", f"{tag}.crossslow2",
@@ -914,15 +935,16 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 f"{tag}.eigengnm", f"{tag}.eigenanm",
                 *[f"{tag}.anm{k}vector" for k in range(1, 37)],
 
-                # processHinges outputs
+                # extra outputs
                 f"{tag}.loops",
+                f"{tag}.hinges",
                 f"{tag}.mode1.ent", f"{tag}.mode2.ent",
                 *[f"anment{k}.pdb" for k in range(1, 37)],
 
                 # zips
                 "ANM-MSF.zip", "ANM-MSFa.zip", "anm136.zip", "panm136.zip",
 
-                # pdb outputs from coor2pdb
+                # pdb outputs
                 *[f"{k}anm.pdb" for k in range(1, 37)],
                 f"{tag}.modeanimation1",
                 f"{tag}.modeanimation2",
