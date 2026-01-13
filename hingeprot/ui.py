@@ -242,13 +242,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         Priority: {tag}.new.hinges then {tag}.hinges then hinges.
         """
         candidates = [
-            os.path.join(run_dir, f"{tag}.new.hinges"),
-            os.path.join(run_dir, f"{tag}.hinges"),
+            os.path.join(run_dir, f"{tag}.hinge"),
             os.path.join(run_dir, "hinges"),
         ]
         fp = next((p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 0), None)
         if not fp:
-            return "Hinge fractions file not found (expected: TAG.new.hinges)."
+            return "Hinge fractions file not found (expected: TAG.hinge)."
 
         keep = []
         with open(fp, "r", encoding="utf-8", errors="ignore") as f:
