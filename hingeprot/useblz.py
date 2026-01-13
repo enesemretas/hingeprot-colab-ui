@@ -1,300 +1,211 @@
-# useblz.py
+#!/usr/bin/env python3
+"""
+useblz.py
+---------
+
+Python replacement for the original Fortran+BLZPACK 'useblz' stage.
+
+Input  : upper-triangular sparse symmetric matrix file (e.g., "upperhessian")
+Output : "<basename>.vwmatrixd" in Fortran list-directed style (spacing/wrapping like gfortran)
+
+Key behavior:
+- Computes k eigenpairs such that there are `target_pos` eigenvalues > 0.
+  (k = target_pos + nneg, where nneg = count(eigenvalues < 0))
+- Writes:
+    1) header:   " nteig N"
+    2) nteig lines:  eigenvalue  true_residual_norm
+    3) eigenvectors flattened column-major: ((x(i,j), i=1..N), j=1..nteig)
+- Formatting:
+    * Leading space on every line (first token has gfortran sign-blank behavior)
+    * 9 significant digits; scientific notation if |x| < 1e-4, else fixed
+    * Between eigenvalue and residual: effectively 2 spaces when residual is positive
+      (because of sign-blank in the token)
+    * Eigenvector stream packed to max 79 chars/line (gfortran default feel)
+"""
+
 from __future__ import annotations
 
-import os
-import math
 import argparse
-from typing import Tuple, Optional
-
+import math
+import os
+import sys
 import numpy as np
-from scipy.sparse import coo_matrix, csc_matrix
-from scipy.sparse.linalg import eigsh  # keeps your current solver
 
 
-# ============================================================
-# 1) FORMAT RULES YOU SPECIFIED
-# ============================================================
+# ------------------------ IO: read upperhessian ------------------------
 
-def format_custom_value(val: float) -> str:
+def read_upperhessian(path: str) -> np.ndarray:
     """
-    9 significant-figure style formatting with your rules:
+    Read symmetric sparse upper-triangular coordinate list:
+      first line: NA
+      next lines: i j value   (1-based indices), only i<=j present
 
-    - If val == 0 -> 0.00000000 (fixed)
-    - If |val| < 1e-4 -> scientific with 8 decimals, E±xx, no '+' sign
-      examples: -3.30213541E-07, 2.22044605E-16
-    - Else fixed-point with variable decimals to keep ~9 significant digits:
-        * abs>=1: total sig digits 9 => decimals = max(0, 9 - digits_before_decimal)
-        * abs<1: decimals = 9 + (#leading_zeros_after_decimal)
-          e.g. 0.711... -> 9 decimals
-               0.0308.. -> 10 decimals
-               0.00308. -> 11 decimals
-               0.000308 -> (would be scientific because <1e-4)
+    Returns dense symmetric matrix A.
     """
-    if val == 0 or val == 0.0:
-        return "0.00000000"
+    with open(path, "r") as f:
+        first = f.readline()
+        if not first:
+            raise ValueError(f"Empty matrix file: {path}")
+        na = int(first.split()[0])  # not strictly required, but validates format
 
-    abs_val = abs(val)
+        rows, cols, vals = [], [], []
+        maxij = 0
+        for line in f:
+            if not line.strip():
+                continue
+            i, j, v = line.split()[:3]
+            i = int(i); j = int(j)
+            v = float(v.replace("D", "E"))
+            rows.append(i - 1)
+            cols.append(j - 1)
+            vals.append(v)
+            if i > maxij: maxij = i
+            if j > maxij: maxij = j
 
-    # Switch to scientific after 0.0001 threshold (>= 4 zeros after decimal)
-    if abs_val < 1e-4:
-        s = f"{val:.8E}"  # 8 decimals
-        # remove "+" in exponent if present
-        s = s.replace("E+","E").replace("e+","E").replace("e","E")
-        return s
+    N = maxij
+    A = np.zeros((N, N), dtype=float)
 
-    # Fixed point with ~9 significant digits
-    if abs_val >= 1.0:
-        digits_before = len(str(int(abs_val)))
-        decimals = 9 - digits_before
-        if decimals < 0:
-            decimals = 0
-        return f"{val:.{decimals}f}"
-
-    # 0 < abs_val < 1: count leading zeros after decimal to decide decimals
-    # Example:
-    # 0.711... => leading_zeros=0 => decimals=9
-    # 0.03.... => leading_zeros=1 => decimals=10
-    # 0.003... => leading_zeros=2 => decimals=11
-    leading_zeros = int(abs(math.floor(math.log10(abs_val))) - 1)
-    decimals = 9 + leading_zeros
-    return f"{val:.{decimals}f}"
-
-
-def row_prefix_for_first_value(first_val_str: str, is_header: bool = False) -> str:
-    """
-    Rule:
-      - Header row starts with ONE space.
-      - Rows 2+:
-          if first value is negative -> ONE space
-          else -> TWO spaces
-    """
-    if is_header:
-        return " "
-    return " " if first_val_str.startswith("-") else "  "
-
-
-def gap_before_value(val_str: str) -> str:
-    """
-    Rule 4:
-      - if value is negative -> one space before it
-      - else -> two spaces before it
-    (This is the spacing *between* values within the same row.)
-    """
-    return " " if val_str.startswith("-") else "  "
-
-
-# ============================================================
-# 2) READ UPPERHESSIAN (COO upper-triangle) -> symmetric CSC
-# ============================================================
-
-def read_upperhessian(filename: str) -> Tuple[csc_matrix, int]:
-    """
-    Reads coordinate sparse format:
-      Line 1: na (optional integer count)
-      Next lines: i j value   (1-based indices)
-
-    Builds a symmetric matrix by mirroring off-diagonal entries.
-    """
-    if not os.path.exists(filename):
-        raise FileNotFoundError(filename)
-
-    with open(filename, "r") as f:
-        raw_lines = f.readlines()
-
-    start = 1
-    try:
-        _ = int(raw_lines[0].strip())
-    except Exception:
-        start = 0
-
-    rows: list[int] = []
-    cols: list[int] = []
-    data: list[float] = []
-    max_idx = -1
-
-    for line in raw_lines[start:]:
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith(("#", "!", "%")):
-            continue
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        v = float(parts[2])
-
-        rows.append(r)
-        cols.append(c)
-        data.append(v)
-        max_idx = max(max_idx, r, c)
-
-    if max_idx < 0:
-        raise ValueError(f"No valid (i, j, val) entries found in {filename}")
-
-    N = max_idx + 1
-
-    full_rows = rows.copy()
-    full_cols = cols.copy()
-    full_data = data.copy()
-
-    for r, c, v in zip(rows, cols, data):
+    for r, c, v in zip(rows, cols, vals):
+        A[r, c] = v
         if r != c:
-            full_rows.append(c)
-            full_cols.append(r)
-            full_data.append(v)
-
-    mat = coo_matrix((full_data, (full_rows, full_cols)), shape=(N, N)).tocsc()
-    return mat, N
+            A[c, r] = v
+    return A
 
 
-# ============================================================
-# 3) WRITE upperhessian.vwmatrixd EXACTLY AS YOU DESCRIBED
-# ============================================================
+# ------------------------ choose k for 36 positive ------------------------
 
-def write_vwmatrixd(
-    output_file: str,
-    evals: np.ndarray,
-    evecs: np.ndarray,
-    imag_tol: float = 1e-4,
-    per_line: int = 5,
-) -> int:
+def find_k_for_target_positive(A: np.ndarray, target_pos: int = 36) -> tuple[int, int]:
+    """
+    Returns (k, nneg) where:
+      nneg = number of eigenvalues < 0
+      k    = target_pos + nneg   so that among the smallest k eigenvalues,
+             there will be target_pos positive ones (assuming negatives come first).
+    """
+    w = np.linalg.eigvalsh(A)
+    nneg = int(np.sum(w < 0.0))
+    k = int(target_pos + nneg)
+    return k, nneg
+
+
+# ------------------------ Fortran-like formatting helpers ------------------------
+
+def _fmt_9sig(x: float) -> str:
+    """9 significant digits; use scientific notation if |x| < 1e-4 else fixed."""
+    if x == 0.0:
+        return "0"
+    ax = abs(x)
+    if ax < 1e-4:
+        return f"{x:.8E}"  # 1 digit + 8 decimals => 9 sig figs
+    e = int(math.floor(math.log10(ax)))
+    decimals = max(0, 9 - (e + 1))
+    s = f"{x:.{decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+def _token(x: float) -> str:
+    """
+    gfortran list-directed "sign blank":
+      + numbers start with a blank
+      - numbers start with '-'
+    """
+    s = _fmt_9sig(float(x))
+    return (" " + s) if x >= 0 else s
+
+def _line_two_numbers(a: float, b: float) -> str:
+    # leading space for the line + token(a) + separator + token(b)
+    return " " + _token(a) + " " + _token(b) + "\n"
+
+def _pack_stream(nums, max_width: int = 79):
+    """
+    Pack a stream of tokens into lines not exceeding max_width.
+    Insert a single separator between tokens; the token's own sign-blank
+    creates the "2 spaces for positive, 1 for negative" feel.
+    """
+    out_lines = []
+    cur = ""
+    for x in nums:
+        t = _token(float(x))
+        if not cur:
+            cur = " " + t  # line-leading space
+        else:
+            cand = cur + " " + t
+            if len(cand) <= max_width:
+                cur = cand
+            else:
+                out_lines.append(cur + "\n")
+                cur = " " + t
+    if cur:
+        out_lines.append(cur + "\n")
+    return out_lines
+
+
+# ------------------------ write .vwmatrixd ------------------------
+
+def write_vwmatrix(out_path: str, eigvals: np.ndarray, residuals: np.ndarray, eigvecs: np.ndarray, max_width: int = 79):
     """
     Writes:
-      Row 1: " [nteig]  [N]"  (header starts with one space)
-      Next nteig rows: eigenvalues real imag
-      Remaining: eigenvectors column-major (vec1 all N, then vec2 all N, ...),
-                 wrapped to 'per_line' values per row (line-wrap does not change parsing).
-
-    Selection rule:
-      nteig is chosen by scanning evals in order and STOPPING at the first eigenvalue
-      with |Imag| > imag_tol.
+      header
+      eigenvalue/residual lines
+      eigenvectors flattened column-major
     """
-    # Ensure complex-safe arrays
-    evals_c = np.asarray(evals, dtype=np.complex128)
-    evecs_c = np.asarray(evecs, dtype=np.complex128)
+    nteig = int(eigvals.size)
+    N = int(eigvecs.shape[0])
 
-    N = int(evecs_c.shape[0])
-    k_avail = int(evecs_c.shape[1])
+    with open(out_path, "w") as f:
+        # Header: first char is a blank
+        f.write(f" {nteig} {N}\n")
 
-    # Determine nteig by "until imag part becomes higher than 1e-4"
-    nteig = 0
-    for i in range(min(len(evals_c), k_avail)):
-        if abs(evals_c[i].imag) > imag_tol:
-            break
-        nteig += 1
+        for lam, res in zip(eigvals, residuals):
+            f.write(_line_two_numbers(float(lam), float(res)))
 
-    if nteig <= 0:
-        raise RuntimeError("No eigenvalues passed the imaginary-part threshold (|Imag| <= 1e-4).")
-
-    # Slice to selected
-    evals_sel = evals_c[:nteig]
-    evecs_sel = evecs_c[:, :nteig]
-
-    with open(output_file, "w") as out:
-        # ---------- HEADER ----------
-        header = f"{nteig}  {N}"
-        out.write(row_prefix_for_first_value(header, is_header=True) + header + "\n")
-
-        # ---------- EIGENVALUES ----------
-        for i in range(nteig):
-            real_str = format_custom_value(float(evals_sel[i].real))
-            imag_str = format_custom_value(float(evals_sel[i].imag))
-
-            # Row start depends on sign of FIRST column (real)
-            line = row_prefix_for_first_value(real_str, is_header=False) + real_str
-            # spacing before imag depends on imag sign
-            line += gap_before_value(imag_str) + imag_str
-            out.write(line + "\n")
-
-        # ---------- EIGENVECTORS (column-major) ----------
-        # Fortran: ((x(i,j),i=1,N),j=1,nteig) => column-major flatten
-        # Use REAL part (ANM symmetric should be real; if complex, this matches "x" being real in Fortran)
-        flat = np.asarray(evecs_sel.real, dtype=np.float64).ravel(order="F")
-
-        # Write with your spacing rules and wrapping
-        idx = 0
-        total = flat.size
-        while idx < total:
-            chunk = flat[idx : min(idx + per_line, total)]
-            # first value decides row prefix
-            first_str = format_custom_value(float(chunk[0]))
-            line = row_prefix_for_first_value(first_str, is_header=False) + first_str
-            for v in chunk[1:]:
-                s = format_custom_value(float(v))
-                line += gap_before_value(s) + s
-            out.write(line + "\n")
-            idx += per_line
-
-    return nteig
+        # ((x(i,j), i=1..N), j=1..nteig) => column-major flatten
+        stream = np.asarray(eigvecs, dtype=float).ravel(order="F")
+        f.writelines(_pack_stream(stream, max_width=max_width))
 
 
-# ============================================================
-# 4) MAIN: solve + sort + write
-# ============================================================
+# ------------------------ main ------------------------
 
-def compute_and_write(
-    input_file: str,
-    output_file: Optional[str] = None,
-    imag_tol: float = 1e-4,
-    per_line: int = 5,
-    also_write_vwmatrix: bool = True,
-) -> str:
-    """
-    Solves eigenproblem (kept as eigsh like your current pipeline),
-    sorts by eigenvalue (ascending), then writes upperhessian.vwmatrixd.
+def _default_out_name(in_path: str) -> str:
+    base = os.path.basename(in_path)
+    if "." in base:
+        base = base[: base.rfind(".")]
+    return base + ".vwmatrixd"
 
-    If also_write_vwmatrix=True, also writes a copy <input>.vwmatrix
-    so your existing ui.py doesn't break.
-    """
-    if output_file is None:
-        output_file = input_file + ".vwmatrixd"
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Compute eigenpairs from upperhessian and write <base>.vwmatrixd.")
+    ap.add_argument("matrix", help="Input upper-triangular matrix file (e.g., upperhessian)")
+    ap.add_argument("--target-pos", type=int, default=36, help="Number of eigenvalues > 0 desired (default: 36)")
+    ap.add_argument("--max-width", type=int, default=79, help="Max line width for packed eigenvector stream (default: 79)")
+    ap.add_argument("--out", default=None, help="Output filename (default: <base>.vwmatrixd)")
+    args = ap.parse_args(argv)
 
-    mat, N = read_upperhessian(input_file)
+    in_path = args.matrix
+    if not os.path.exists(in_path):
+        raise FileNotFoundError(f"Matrix file not found: {in_path}")
 
-    # Keep your existing behavior: eigsh (symmetric).
-    # (Imag parts will be 0, but we still implement the imag_tol selection exactly.)
-    k = min(60, max(2, N - 1))  # a safe default; selection is handled after
-    evals, evecs = eigsh(mat, k=k, sigma=0.0, which="LM")
+    A = read_upperhessian(in_path)
 
-    # Sort by eigenvalue (ascending real part)
-    order = np.argsort(np.real(evals))
-    evals = evals[order]
-    evecs = evecs[:, order]
+    k, nneg = find_k_for_target_positive(A, target_pos=args.target_pos)
 
-    write_vwmatrixd(output_file, evals, evecs, imag_tol=imag_tol, per_line=per_line)
+    # Full dense solve (A is typically ~ 3Nres, still manageable for hingeprot sizes)
+    w_all, V_all = np.linalg.eigh(A)
+    w = w_all[:k]
+    V = V_all[:, :k]
 
-    if also_write_vwmatrix:
-        compat = input_file + ".vwmatrix"
-        if compat != output_file:
-            # write the same content to .vwmatrix too
-            # (ui.py currently looks for upperhessian.vwmatrix)
-            # simplest: copy by re-writing using same already-solved eval/evec
-            write_vwmatrixd(compat, evals, evecs, imag_tol=imag_tol, per_line=per_line)
+    # True residual norms: ||A v - λ v||_2
+    R = A @ V - V * w
+    res = np.linalg.norm(R, axis=0)
 
-    return output_file
+    out_path = args.out or _default_out_name(in_path)
+    write_vwmatrix(out_path, w, res, V, max_width=args.max_width)
 
-
-def _main_cli() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("input_file", help="e.g. upperhessian")
-    ap.add_argument("--out", default=None, help="Default: <input>.vwmatrixd")
-    ap.add_argument("--imag_tol", type=float, default=1e-4)
-    ap.add_argument("--per_line", type=int, default=5)
-    ap.add_argument("--no_compat", action="store_true", help="Do NOT also write <input>.vwmatrix")
-    args = ap.parse_args()
-
-    out = compute_and_write(
-        args.input_file,
-        output_file=args.out,
-        imag_tol=args.imag_tol,
-        per_line=args.per_line,
-        also_write_vwmatrix=(not args.no_compat),
-    )
-    print(out)
+    # Minimal stdout for UI log
+    pos_count = int(np.sum(w > 0.0))
+    print(f"useblz.py: N={A.shape[0]}, nneg={nneg}, k={k}, positive_in_written={pos_count}")
+    print(f"useblz.py: wrote {out_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    _main_cli()
+    raise SystemExit(main())
