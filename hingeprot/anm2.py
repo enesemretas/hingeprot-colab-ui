@@ -157,26 +157,33 @@ def write_upperhessian(
     tol: float = 0.0
 ) -> None:
     """
-    Output format (no leading spaces, exactly ONE space between tokens):
+    Output format:
+      - no leading spaces
+      - exactly ONE space between tokens
+      - NEVER scientific notation (no E-notation)
 
-      "98365"
-      "1 1 1.53889489"
-      "1 2 -0.0136846798"
-
-    Numeric formatting: .10G (so tiny values appear as ...E-06, etc.)
+    Values are written in fixed-point (decimal) form, then trimmed.
     """
     items = [((i, j), v) for (i, j), v in sparse_upper.items() if abs(v) > tol]
     items.sort(key=lambda t: (t[0][0], t[0][1]))
 
+    def fmt_no_sci(x: float, decimals: int = 10) -> str:
+        # fixed-point, then trim trailing zeros and dot
+        s = f"{x:.{decimals}f}"
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        # avoid "-0"
+        if s == "-0":
+            s = "0"
+        return s
+
     out = Path(outpath)
     with out.open("w", encoding="utf-8") as f:
-        # first line: NO leading space
         f.write(f"{len(items)}\n")
-
         for (i, j), v in items:
-            vstr = f"{v:.10G}".replace("D", "E")
-            # each token separated by exactly ONE space
+            vstr = fmt_no_sci(float(v), decimals=10)
             f.write(f"{i+1} {j+1} {vstr}\n")
+
 
 
 
