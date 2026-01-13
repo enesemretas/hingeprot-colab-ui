@@ -157,11 +157,11 @@ def write_upperhessian(
     tol: float = 0.0
 ) -> None:
     """
-    Write in the spacing style you showed from Fortran:
+    Output format (no leading spaces, exactly ONE space between tokens):
 
-      " 98365"
-      " 1 1  1.53889489"     (positive => TWO spaces between col2 and value)
-      " 1 2 -0.0136846798"   (negative => ONE space between col2 and value)
+      "98365"
+      "1 1 1.53889489"
+      "1 2 -0.0136846798"
 
     Numeric formatting: .10G (so tiny values appear as ...E-06, etc.)
     """
@@ -170,14 +170,14 @@ def write_upperhessian(
 
     out = Path(outpath)
     with out.open("w", encoding="utf-8") as f:
-        # leading space on first line
-        f.write(f" {len(items)}\n")
+        # first line: NO leading space
+        f.write(f"{len(items)}\n")
 
         for (i, j), v in items:
-            vstr = f"{v:.10G}"  # Fortran-like: switches to E for small values
-            sep = "  " if not vstr.startswith("-") else " "  # EXACT rule you requested
-            # leading space at line start
-            f.write(f" {i+1} {j+1}{sep}{vstr}\n")
+            vstr = f"{v:.10G}".replace("D", "E")
+            # each token separated by exactly ONE space
+            f.write(f"{i+1} {j+1} {vstr}\n")
+
 
 
 def main() -> None:
