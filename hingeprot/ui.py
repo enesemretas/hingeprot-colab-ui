@@ -656,13 +656,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
                 raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
 
-            _show_log("Solving eigenproblem with useblz.py (k=38, sigma=machine epsilon)...")
+            _show_log("Solving eigenproblem with useblz.py (36 positive eigenpairs; writes upperhessian.vwmatrixd)...")
             _run(["python3", USEBLZ_PY, "upperhessian"], cwd=run_dir, title="useblz.py")
             progress.value += 1
 
             out_vw = os.path.join(run_dir, "upperhessian.vwmatrixd")
             if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
-                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrix (missing/empty).")
+                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrixd (missing/empty).")
             _show_log(f"Eigen solve done. Wrote: {out_vw}")
 
             _run(
@@ -724,7 +724,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 "crosscorrslow1", "crosscorrslow2", "crosscorrslow1ext",
 
                 # anm
-                "upperhessian", "upperhessian.vwmatrix",
+                "upperhessian", "upperhessian.vwmatrixd",
                 "eigenanm", "newcoordinat.mds",
 
                 # extract outputs
