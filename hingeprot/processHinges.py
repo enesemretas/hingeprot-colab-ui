@@ -1,10 +1,10 @@
+# processHinges.py
 from __future__ import annotations
+
 import argparse
 import os
-import sys
-import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Iterable
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
@@ -16,6 +16,15 @@ class ResKey:
     chain: str
     resnum: int
     icode: str  # insertion code (single char or space)
+
+
+@dataclass(frozen=True)
+class HingePoint:
+    mode: int          # 1 or 2
+    seq_idx: int       # 1-based residue-order index (from hinge file col-1)
+    chain: str
+    resnum: int
+    icode: str
 
 
 def _safe_float(s: str, default: float = 0.0) -> float:
@@ -53,9 +62,11 @@ def read_pdb_atoms(pdb_path: str):
             if rec not in ("ATOM", "HETATM"):
                 continue
 
-            # PDB fixed columns
             chain = (line[21] if len(line) > 21 else " ").strip() or "A"
-            resnum = int(line[22:26])
+            try:
+                resnum = int(line[22:26])
+            except Exception:
+                continue
             icode = (line[26] if len(line) > 26 else " ")
             key = ResKey(chain=chain, resnum=resnum, icode=icode)
 
@@ -74,7 +85,7 @@ def read_pdb_atoms(pdb_path: str):
                 ca_xyz.append((x, y, z))
 
     if not ca_keys:
-        raise ValueError("No CA atoms found in the input PDB. (aaMol.size() == 0 equivalent)")
+        raise ValueError("No CA atoms found in the input PDB.")
 
     return (
         lines,
@@ -90,30 +101,27 @@ def format_pdb_line_with_xyz_b(line: str, x: float, y: float, z: float, bfac: fl
     """
     Update x,y,z and B-factor in an ATOM/HETATM line while preserving the rest.
     """
-    # Ensure line has at least 66 columns
     if len(line) < 66:
         line = line.ljust(66)
 
     head = line[:30]
-    occ = line[54:60]  # keep occupancy as-is
+    occ = line[54:60]
     tail = line[66:] if len(line) > 66 else ""
 
     return f"{head}{x:8.3f}{y:8.3f}{z:8.3f}{occ}{bfac:6.2f}{tail}".rstrip()
 
 
-# ------------------------- Vector + hinge parsing -------------------------
+# ------------------------- Vector parsing -------------------------
 
 def read_vector_file(vec_path: str, n_res: int) -> np.ndarray:
     """
-    Vector file format observed:
-      idx  dx  dy  dz  (optional magnitude column)
-    idx is 1-based and follows the CA residue order.
+    Vector file format:
+      idx  dx  dy  dz  (optional magnitude col)
+    idx is 1-based and follows CA residue order.
     """
     v = np.zeros((n_res, 3), dtype=float)
     with open(vec_path, "r", errors="ignore") as f:
         for line in f:
-            if not line.strip():
-                continue
             parts = line.split()
             if len(parts) < 4:
                 continue
@@ -122,25 +130,49 @@ def read_vector_file(vec_path: str, n_res: int) -> np.ndarray:
             except Exception:
                 continue
             if 0 <= i < n_res:
-                v[i, 0] = float(parts[1])
-                v[i, 1] = float(parts[2])
-                v[i, 2] = float(parts[3])
+                try:
+                    v[i, 0] = float(parts[1])
+                    v[i, 1] = float(parts[2])
+                    v[i, 2] = float(parts[3])
+                except Exception:
+                    pass
     return v
 
 
-def parse_hinge_file(hinge_path: str) -> Dict[int, List[Tuple[int, int, str]]]:
-    """
-    Hinge file observed to have sections:
-      "1st slowest mode"
-      <pairs>
-      "2nd slowest mode"
-      <pairs>
+# ------------------------- Hinge parsing (ROBUST) -------------------------
 
-    Each pair line looks like:
-      <i>  <j>  <Chain>
-    Example: 47  57  A
+def _split_res_token(tok: str) -> Tuple[Optional[int], str]:
     """
-    out: Dict[int, List[Tuple[int, int, str]]] = {1: [], 2: []}
+    tok may be: '57', '57A' (resnum + insertion code), etc.
+    Returns: (resnum, icode_or_space)
+    """
+    tok = tok.strip()
+    if not tok:
+        return None, " "
+
+    i = 0
+    while i < len(tok) and tok[i].isdigit():
+        i += 1
+    if i == 0:
+        return None, " "
+
+    resnum = int(tok[:i])
+    rest = tok[i:]
+    icode = rest[:1] if rest else " "
+    return resnum, (icode if icode else " ")
+
+
+def parse_hinge_file(hinge_path: str) -> Dict[int, List[HingePoint]]:
+    """
+    Parses Fortran-like hinge output:
+      ----> crosscorrelation : 1st slowest mode
+         47   57A  A
+         257  267   A
+    Column1: seq index (1-based)
+    Column2: residue number (+ optional insertion code)
+    Column3: chain ID
+    """
+    out: Dict[int, List[HingePoint]] = {1: [], 2: []}
     mode: Optional[int] = None
 
     with open(hinge_path, "r", errors="ignore") as f:
@@ -148,10 +180,12 @@ def parse_hinge_file(hinge_path: str) -> Dict[int, List[Tuple[int, int, str]]]:
             s = raw.strip()
             if not s:
                 continue
-            if "1st slowest mode" in s:
+
+            low = s.lower()
+            if "1st slowest mode" in low:
                 mode = 1
                 continue
-            if "2nd slowest mode" in s:
+            if "2nd slowest mode" in low:
                 mode = 2
                 continue
             if s.startswith("---->"):
@@ -160,175 +194,214 @@ def parse_hinge_file(hinge_path: str) -> Dict[int, List[Tuple[int, int, str]]]:
                 continue
 
             parts = s.split()
-            if len(parts) < 3:
+            if len(parts) < 2:
                 continue
 
-            # tolerate accidental extra columns
             try:
-                a = int(parts[0])
-                b = int(parts[1])
-                ch = parts[2].strip()[:1] or "A"
+                seq_idx = int(float(parts[0]))
             except Exception:
                 continue
 
-            out[mode].append((a, b, ch))
+            res_tok = parts[1]
+            resnum, icode = _split_res_token(res_tok)
+            if resnum is None:
+                continue
 
-    # Basic sanity
+            chain = (parts[2].strip()[:1] if len(parts) >= 3 else "A") or "A"
+            out[mode].append(HingePoint(mode=mode, seq_idx=seq_idx, chain=chain, resnum=resnum, icode=icode))
+
     if not out[1] and not out[2]:
-        raise ValueError("No hinge pairs parsed from hinge file.")
+        raise ValueError("No hinge entries parsed from hinge file.")
 
     return out
 
 
-# ------------------------- Heuristics to match 3LZG outputs -------------------------
-
-def _centroid_for_range(
-    ca_keys: List[ResKey],
-    ca_xyz: np.ndarray,
-    chain: str,
-    lo: int,
-    hi: int,
-) -> np.ndarray:
-    idx = [
-        i for i, k in enumerate(ca_keys)
-        if k.chain == chain and lo <= k.resnum <= hi
-    ]
-    if not idx:
-        return np.zeros(3, dtype=float)
-    return ca_xyz[idx].mean(axis=0)
+def _res_label(k: ResKey) -> str:
+    ic = (k.icode.strip() or "")
+    return f"{k.resnum}{ic}{k.chain}"
 
 
-def _mean_mag_for_range(
-    ca_keys: List[ResKey],
-    vec_mag: np.ndarray,
-    chain: str,
-    lo: int,
-    hi: int,
-) -> float:
-    idx = [
-        i for i, k in enumerate(ca_keys)
-        if k.chain == chain and lo <= k.resnum <= hi
-    ]
-    if not idx:
-        return float("inf")
-    return float(np.mean(vec_mag[idx]))
+# ------------------------- Rigid segments from hinges -------------------------
 
-
-def select_boundary_pairs(
-    pairs: List[Tuple[int, int, str]],
-    ca_keys: List[ResKey],
-    ca_xyz: np.ndarray,
-    vec_mag: np.ndarray,
-    outlier_mult: float = 5.0,
-) -> Tuple[int, int, List[int]]:
+def clean_hinges_for_chain(
+    chain_keys: List[ResKey],
+    hinge_positions: List[int],
+    min_seg_len: int,
+) -> Tuple[List[int], List[Tuple[ResKey, ResKey]]]:
     """
-    Selects (left_pair_idx, right_pair_idx, kept_indices) using heuristics that
-    reproduce core intervals seen in your 3LZG outputs.
+    Removes hinge positions that would create too-short segments (<min_seg_len).
 
-    Steps:
-      - compute mean vector magnitude over each (a..b) range
-      - drop outliers: mean > median * outlier_mult
-      - pick right pair as the one with largest max(a,b)
-      - pick left pair as (among kept, excluding right) the one whose centroid is farthest
-        from the right pair centroid
+    IMPORTANT (your rule to keep "last hinge" in a close cluster):
+      If segment between two consecutive hinges is too short, we remove the *earlier* hinge,
+      shifting the boundary to the later hinge.
+
+    Returns:
+      cleaned_positions: hinge positions (0-based in chain_keys)
+      short_flexible_fragments: list of (left_res, right_res) boundary pairs
     """
-    if not pairs:
-        return 0, 0, []
+    N = len(chain_keys)
+    pos = sorted(set([p for p in hinge_positions if 0 <= p < N]))
+    sff: List[Tuple[ResKey, ResKey]] = []
 
-    mags = []
-    cents = []
-    for (a, b, ch) in pairs:
-        lo, hi = (a, b) if a <= b else (b, a)
-        mags.append(_mean_mag_for_range(ca_keys, vec_mag, ch, lo, hi))
-        cents.append(_centroid_for_range(ca_keys, ca_xyz, ch, lo, hi))
+    if N == 0 or not pos:
+        return pos, sff
 
-    finite = [m for m in mags if math.isfinite(m)]
-    med = float(np.median(finite)) if finite else 0.0
+    while True:
+        changed = False
 
-    kept = [
-        i for i, m in enumerate(mags)
-        if math.isfinite(m) and (med == 0.0 or m <= med * outlier_mult)
-    ]
-    if not kept:
-        kept = list(range(len(pairs)))
-
-    right = max(kept, key=lambda i: max(pairs[i][0], pairs[i][1]))
-    right_c = cents[right]
-    left_cands = [i for i in kept if i != right]
-    left = right if not left_cands else max(left_cands, key=lambda i: float(np.linalg.norm(cents[i] - right_c)))
-
-    return left, right, kept
-
-
-def core_interval_from_pairs(pairs: List[Tuple[int, int, str]], left_idx: int, right_idx: int) -> Tuple[int, int, str]:
-    """
-    Core interval = [left_end+1, right_end] on the selected chain.
-    """
-    aL, bL, chL = pairs[left_idx]
-    aR, bR, chR = pairs[right_idx]
-    ch = chR  # in practice same chain
-    left_end = max(aL, bL)
-    right_end = max(aR, bR)
-    if left_end > right_end:
-        left_end, right_end = right_end, left_end
-    return left_end + 1, right_end, ch
-
-
-def compute_loops(
-    pairs: List[Tuple[int, int, str]],
-    exclude_idxs: set[int],
-    loop_thr: int,
-) -> List[Tuple[int, int, str]]:
-    """
-    Reproduces the 3LZG .loops behavior:
-
-      (A) "sliding" pairs:
-          consecutive pairs where (a2==a1+1 and b2==b1+1) -> loop [b1,b2]
-      (B) "disjoint-shift" pairs:
-          for each pair i, find the nearest later pair j such that a_j >= b_i (non-overlapping),
-          and if (a_j-a_i) == (b_j-b_i) and 5<=shift<=loop_thr -> loop [b_i,b_j]
-
-    Boundary pairs (left/right) are excluded to avoid generating loops that cross the core boundary.
-    """
-    kept = [(i, p) for i, p in enumerate(pairs) if i not in exclude_idxs]
-    kept.sort(key=lambda t: (t[1][2], t[1][0], t[1][1]))  # by chain, then a,b
-
-    loops = set()
-
-    # (A) sliding consecutive
-    for (i1, p1), (i2, p2) in zip(kept, kept[1:]):
-        a1, b1, ch1 = p1
-        a2, b2, ch2 = p2
-        if ch1 != ch2:
+        # start segment before first hinge: 0..pos[0] (len = pos[0]+1)
+        if pos and (pos[0] + 1) < min_seg_len:
+            sff.append((chain_keys[0], chain_keys[pos[0]]))
+            pos.pop(0)
+            changed = True
             continue
-        if a2 == a1 + 1 and b2 == b1 + 1 and abs(b2 - b1) <= loop_thr:
-            loops.add((min(b1, b2), max(b1, b2), ch1))
 
-    # (B) disjoint-shift nearest non-overlapping
-    for idx, (i, p1) in enumerate(kept):
-        a1, b1, ch1 = p1
-        for jdx in range(idx + 1, len(kept)):
-            a2, b2, ch2 = kept[jdx][1]
-            if ch2 != ch1:
-                continue
-            if a2 >= b1:
-                shift_a = a2 - a1
-                shift_b = b2 - b1
-                if shift_a == shift_b and 5 <= shift_b <= loop_thr:
-                    loops.add((min(b1, b2), max(b1, b2), ch1))
+        # between hinges: segment (pos[i]+1 .. pos[i+1]) length = pos[i+1]-pos[i]
+        removed = False
+        for i in range(len(pos) - 1):
+            if (pos[i + 1] - pos[i]) < min_seg_len:
+                sff.append((chain_keys[pos[i]], chain_keys[pos[i + 1]]))
+                pos.pop(i)  # remove earlier hinge
+                removed = True
+                changed = True
                 break
+        if removed:
+            continue
 
-    return sorted(loops, key=lambda t: (t[0], t[1], t[2]))
+        # end segment after last hinge: (pos[-1]+1 .. N-1) len = N-pos[-1]-1
+        if pos and (N - pos[-1] - 1) < min_seg_len:
+            sff.append((chain_keys[pos[-1]], chain_keys[-1]))
+            pos.pop(-1)
+            changed = True
+            continue
+
+        if not changed:
+            break
+
+    return pos, sff
 
 
-# ------------------------- Writing outputs -------------------------
+def build_bfactors_from_hinges(
+    ca_keys: List[ResKey],
+    hinges: Dict[int, List[HingePoint]],
+    min_seg_len: int = 15,
+    bmag: float = 10.0,
+) -> Tuple[Dict[int, Dict[ResKey, float]], Dict[int, Dict[str, List[Tuple[int, int]]]]]:
+    """
+    Returns:
+      bfac_by_mode: {mode -> {ResKey -> bfac}}
+      report_by_mode: {mode -> dict} where dict includes:
+         report_by_mode[mode][chain] = [(start_resnum,end_resnum), ...] segments
+         report_by_mode[mode][f"{chain}__SFF"] = [(start_resnum,end_resnum), ...] short flexible fragments
+    """
+    chains = sorted(set(k.chain for k in ca_keys))
+    chain_keys: Dict[str, List[ResKey]] = {ch: [k for k in ca_keys if k.chain == ch] for ch in chains}
 
-def write_loops_file(out_path: str, loops_by_mode: Dict[int, List[Tuple[int, int, str]]]):
-    with open(out_path, "w") as f:
+    global_indices_by_chain = {ch: [i for i, k in enumerate(ca_keys) if k.chain == ch] for ch in chains}
+    chain_pos_of_global: Dict[str, Dict[int, int]] = {ch: {} for ch in chains}
+    for ch in chains:
+        idxs = global_indices_by_chain[ch]
+        chain_pos_of_global[ch] = {g: ci for ci, g in enumerate(idxs)}
+
+    bfac_by_mode: Dict[int, Dict[ResKey, float]] = {1: {}, 2: {}}
+    report_by_mode: Dict[int, Dict[str, List[Tuple[int, int]]]] = {1: {}, 2: {}}
+
+    for mode in (1, 2):
+        hinges_mode = sorted(hinges.get(mode, []), key=lambda h: h.seq_idx)
+
+        for ch in chains:
+            keys = chain_keys[ch]
+            N = len(keys)
+            if N == 0:
+                continue
+
+            # candidate hinge positions in chain coords
+            cand_chainpos: List[int] = []
+            for hp in hinges_mode:
+                if hp.chain != ch:
+                    continue
+
+                gpos = hp.seq_idx - 1
+                if 0 <= gpos < len(ca_keys) and ca_keys[gpos].chain == ch:
+                    cand_chainpos.append(chain_pos_of_global[ch][gpos])
+                else:
+                    # fallback: match by resnum/icode
+                    for ci, kk in enumerate(keys):
+                        if kk.resnum == hp.resnum and (hp.icode.strip() == "" or kk.icode.strip() == hp.icode.strip()):
+                            cand_chainpos.append(ci)
+                            break
+
+            cleaned, sff = clean_hinges_for_chain(keys, cand_chainpos, min_seg_len=min_seg_len)
+
+            # segments between hinges (each segment alternates sign)
+            segs: List[Tuple[int, int]] = []
+            start = 0
+            for p in cleaned:
+                if start <= p:
+                    segs.append((start, p))
+                start = p + 1
+            if start <= N - 1:
+                segs.append((start, N - 1))
+
+            report_by_mode[mode][ch] = [(keys[a].resnum, keys[b].resnum) for a, b in segs]
+            if sff:
+                report_by_mode[mode][f"{ch}__SFF"] = [(a.resnum, b.resnum) for a, b in sff]
+
+            # assign B factors (constant per segment; sign flips each hinge)
+            idxs_global = global_indices_by_chain[ch]
+            for si, (a, b) in enumerate(segs):
+                sign = 1.0 if (si % 2 == 0) else -1.0
+                bval = float(bmag) * sign
+                for ci in range(a, b + 1):
+                    g = idxs_global[ci]
+                    bfac_by_mode[mode][ca_keys[g]] = bval
+
+    return bfac_by_mode, report_by_mode
+
+
+def write_rigidparts_report(
+    out_path: str,
+    report_by_mode: Dict[int, Dict[str, List[Tuple[int, int]]]],
+    ca_keys: List[ResKey],
+    hinges: Dict[int, List[HingePoint]],
+):
+    with open(out_path, "w", encoding="utf-8") as f:
         for mode in (1, 2):
-            for lo, hi, ch in loops_by_mode.get(mode, []):
-                f.write(f"{mode} {lo} {hi} {ch}:\n")
+            f.write(f"----> Slowest mode {mode}:\n")
 
+            part_no = 1
+            for ch in sorted(set(k.chain for k in ca_keys)):
+                segs = report_by_mode.get(mode, {}).get(ch, [])
+                for (a, b) in segs:
+                    f.write(f"Rigid Part {part_no} {ch}:{a}-{b}\n")
+                    part_no += 1
+
+            # raw hinge residues list (as seen from seq_idx mapping if possible)
+            hinge_list = []
+            for hp in sorted(hinges.get(mode, []), key=lambda x: x.seq_idx):
+                gpos = hp.seq_idx - 1
+                if 0 <= gpos < len(ca_keys):
+                    hinge_list.append(_res_label(ca_keys[gpos]))
+                else:
+                    ic = (hp.icode.strip() or "")
+                    hinge_list.append(f"{hp.resnum}{ic}{hp.chain}")
+            if hinge_list:
+                f.write("Hinge residues: " + " ".join(hinge_list) + "\n")
+
+            any_sff = False
+            for key, segs in report_by_mode.get(mode, {}).items():
+                if key.endswith("__SFF") and segs:
+                    if not any_sff:
+                        f.write("Short Flexible Fragments:\n")
+                        any_sff = True
+                    ch = key.split("__SFF")[0]
+                    for (a, b) in segs:
+                        f.write(f"{ch}:{a}-{b}\n")
+
+            f.write("\n")
+
+
+# ------------------------- Writing moved PDB -------------------------
 
 def write_moved_pdb(
     out_path: str,
@@ -337,55 +410,48 @@ def write_moved_pdb(
     atom_keys: List[ResKey],
     atom_xyz: np.ndarray,
     ca_keys: List[ResKey],
-    vec: np.ndarray,  # per-CA-residue vectors
-    core_start: int,
-    core_end: int,
-    core_chain: str,
+    vec: np.ndarray,
+    bfac_map: Dict[ResKey, float],
     clustering_dist_thr: float,
 ):
-    # Scale so that the maximum displacement from MODEL6 to MODEL11 is ~ clustering_dist_thr.
-    # With factors -5..+5, MODEL11 uses factor +5, so per-step max ~ clustering_dist_thr/5.
+    # scale displacement so step size matches previous behavior
     vec_mag = np.linalg.norm(vec, axis=1)
     max_mag = float(vec_mag.max()) if vec_mag.size else 1.0
-    if max_mag <= 0:
+    if max_mag <= 0.0:
         max_mag = 1.0
     per_step_target = float(clustering_dist_thr) / 5.0
     scale = per_step_target / max_mag
 
-    # Map CA vectors to residue keys (one vector per residue)
     resvec: Dict[ResKey, np.ndarray] = {k: vec[i] for i, k in enumerate(ca_keys)}
 
-    # Precompute B-factor mask by residue number (chain-aware)
     def bfac_for_key(k: ResKey) -> float:
-        if k.chain == core_chain and (core_start <= k.resnum <= core_end):
-            return 10.00
-        return 5.00
+        return float(bfac_map.get(k, 0.0))
 
     factors = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
 
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         for mi, fac in enumerate(factors, start=1):
             f.write(f"MODEL{mi:9d}\n")
-            # copy base lines (will patch ATOM/HETATM lines)
             out_lines = list(lines)
 
-            # Apply per-residue displacement to every atom line
             for ai, li in enumerate(atom_idx):
                 k = atom_keys[ai]
-                disp = resvec.get(k, None)
+                disp = resvec.get(k)
                 if disp is None:
                     continue
+
                 dx, dy, dz = (disp * scale * float(fac))
                 x0, y0, z0 = atom_xyz[ai]
-                x, y, z = (x0 + dx, y0 + dy, z0 + dz)
-                out_lines[li] = format_pdb_line_with_xyz_b(out_lines[li], x, y, z, bfac_for_key(k))
+                out_lines[li] = format_pdb_line_with_xyz_b(
+                    out_lines[li],
+                    x0 + dx, y0 + dy, z0 + dz,
+                    bfac_for_key(k),
+                )
 
-            # Write out, skipping any existing MODEL/ENDMDL in the input
             for line in out_lines:
                 if line.startswith("MODEL") or line.startswith("ENDMDL"):
                     continue
                 f.write(line.rstrip() + "\n")
-
             f.write("ENDMDL\n")
 
 
@@ -397,66 +463,54 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("hinge_file")
     ap.add_argument("vector_file1")
     ap.add_argument("vector_file2")
-    ap.add_argument("loop_thr", type=int)
+    ap.add_argument("loop_thr", type=int)  # backward-compatible (unused here)
     ap.add_argument("clustering_dist_thr", type=float)
+
+    ap.add_argument("--min_seg_len", type=int, default=15, help="Minimum segment length; shorter segments remove hinge.")
+    ap.add_argument("--bf_mag", type=float, default=10.0, help="Magnitude of B-factor values (+/-).")
+    ap.add_argument("--write_rigidparts", action="store_true", help="Write PDB_ID.rigidparts.txt report.")
+
     args = ap.parse_args(argv)
 
-    (
-        lines,
-        atom_idx,
-        atom_keys,
-        atom_xyz,
-        ca_keys,
-        ca_xyz,
-    ) = read_pdb_atoms(args.pdb_file)
+    lines, atom_idx, atom_keys, atom_xyz, ca_keys, _ca_xyz = read_pdb_atoms(args.pdb_file)
+    hinges = parse_hinge_file(args.hinge_file)
 
-    hinge = parse_hinge_file(args.hinge_file)
+    bfac_by_mode, report_by_mode = build_bfactors_from_hinges(
+        ca_keys,
+        hinges,
+        min_seg_len=args.min_seg_len,
+        bmag=args.bf_mag,
+    )
 
     v1 = read_vector_file(args.vector_file1, n_res=len(ca_keys))
     v2 = read_vector_file(args.vector_file2, n_res=len(ca_keys))
 
-    # Select boundaries + core intervals
-    mag1 = np.linalg.norm(v1, axis=1)
-    mag2 = np.linalg.norm(v2, axis=1)
-
-    left1, right1, kept1 = select_boundary_pairs(hinge.get(1, []), ca_keys, ca_xyz, mag1, outlier_mult=5.0)
-    left2, right2, kept2 = select_boundary_pairs(hinge.get(2, []), ca_keys, ca_xyz, mag2, outlier_mult=5.0)
-
-    core1_start, core1_end, core1_chain = core_interval_from_pairs(hinge[1], left1, right1)
-    core2_start, core2_end, core2_chain = core_interval_from_pairs(hinge[2], left2, right2)
-
-    # Loops (exclude boundary pairs)
-    loops1 = compute_loops(hinge.get(1, []), exclude_idxs={left1, right1}, loop_thr=args.loop_thr)
-    loops2 = compute_loops(hinge.get(2, []), exclude_idxs={left2, right2}, loop_thr=args.loop_thr)
-
-    # Write outputs next to pdb file
-    out_loops = args.pdb_file + ".loops"
-    out_m1 = args.pdb_file + ".moved1.pdb"
-    out_m2 = args.pdb_file + ".moved2.pdb"
-
-    write_loops_file(out_loops, {1: loops1, 2: loops2})
+    base, _ = os.path.splitext(args.pdb_file)
+    out_m1 = base + ".moved1.pdb"
+    out_m2 = base + ".moved2.pdb"
+    out_rp = base + ".rigidparts.txt"
 
     write_moved_pdb(
         out_m1,
         lines, atom_idx, atom_keys, atom_xyz, ca_keys,
         v1,
-        core1_start, core1_end, core1_chain,
+        bfac_by_mode[1],
         args.clustering_dist_thr,
     )
     write_moved_pdb(
         out_m2,
         lines, atom_idx, atom_keys, atom_xyz, ca_keys,
         v2,
-        core2_start, core2_end, core2_chain,
+        bfac_by_mode[2],
         args.clustering_dist_thr,
     )
 
-    print(f"Wrote: {out_loops}")
+    if args.write_rigidparts:
+        write_rigidparts_report(out_rp, report_by_mode, ca_keys, hinges)
+        print(f"Wrote: {out_rp}")
+
     print(f"Wrote: {out_m1}")
     print(f"Wrote: {out_m2}")
-    print(f"Mode1 core (bf=10): {core1_chain}:{core1_start}-{core1_end}")
-    print(f"Mode2 core (bf=10): {core2_chain}:{core2_start}-{core2_end}")
-
     return 0
 
 
