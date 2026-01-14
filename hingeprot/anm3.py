@@ -13,8 +13,9 @@
 #   - 1cross..10cross
 #
 # Changes requested by user:
-#   - eigenanm: write the first 36 eigenvalues that are > 0 (skip zeros/negatives),
-#               and do NOT write any header/count line.
+#   - eigenanm: write DIRECTLY the first 36 eigenvalues (no filtering by sign),
+#               do NOT write any header/count line,
+#               and do NOT include index column (only eigenvalue per line).
 #   - newcoordinat.mds: remove the last three trailing 0.000 columns.
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import argparse
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -54,7 +55,6 @@ def parse_alpha_cor(alpha_path: str, max_size: int = 5000) -> AlphaCorData:
     Parse alpha.cor using the FORTRAN format:
       65 FORMAT (A6,1X,I4,1X,A4,1X,A3,1x,A1,I4,A1,3X,3F8.3)
     """
-    # Pre-allocate (1..max_size). Index 0 unused.
     attyp = [""] * (max_size + 1)
     restyp = [""] * (max_size + 1)
     chnam = [""] * (max_size + 1)
@@ -183,7 +183,7 @@ class EigenData:
     n_modes: int
 
 
-def parse_eigen_file(eig_path: str, max_modes: int = 60, nmax_expected: int | None = None) -> EigenData:
+def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | None = None) -> EigenData:
     """
     Supports TWO formats:
 
@@ -386,26 +386,23 @@ def parse_eigen_file(eig_path: str, max_modes: int = 60, nmax_expected: int | No
 
 def write_eigenanm(outdir: str, eig: EigenData) -> None:
     """
-    Write eigenanm as:
-      index   eigenvalue
-    Taking DIRECTLY the first 36 eigenvalues (no filtering).
-    No header/count line is written.
+    eigenanm format (changed as requested):
+      - exactly first 36 eigenvalues
+      - NO header/count line
+      - NO index column: only eigenvalue per line
     """
     path = os.path.join(outdir, "eigenanm")
     with open(path, "w", encoding="utf-8") as f:
-        # Always write 1..36 (if missing, w1 entries remain 0.0)
         for i in range(1, 37):
             val = float(eig.w1[i]) if i < len(eig.w1) else 0.0
-            f.write(f"{i:4d}  {val:8.4f}\n")
+            f.write(f"{val:8.4f}\n")
 
 
 def fmt_9798(j: int, x: float, y: float, z: float, mag: float) -> str:
-    # 9798 format (I4,4(3x,F8.5))
     return f"{j:4d}   {x:8.5f}   {y:8.5f}   {z:8.5f}   {mag:8.5f}\n"
 
 
 def fmt_9799(i: int, j: int, val: float) -> str:
-    # 9799 format (I4,I4,3x,F8.5)
     return f"{i:4d}{j:4d}   {val:8.5f}\n"
 
 
@@ -414,7 +411,6 @@ def write_coor_and_cross(outdir: str, eig: EigenData) -> None:
     jres = eig.jres
     n_modes = eig.n_modes
 
-    # Mode selections as in FORTRAN
     k1 = 7
     k2 = k1 + 1
     k3 = k1 + 2
@@ -509,8 +505,8 @@ def write_newcoordinat(
     jres: int
 ) -> None:
     """
-    Write newcoordinat.mds.
-    User request: remove the last three trailing 0.000 columns.
+    newcoordinat.mds:
+      trailing 3 zero columns removed (as requested)
     """
     path = os.path.join(outdir, "newcoordinat.mds")
     with open(path, "w", encoding="utf-8") as f:
@@ -555,7 +551,7 @@ def main() -> None:
 
     nmax_expected = 3 * alpha.resnum
 
-    # IMPORTANT: read more than 36 modes so we can skip zero modes and still write 36 positive eigenvalues if available
+    # Read exactly 36 modes/eigenvalues (first 36)
     eig = parse_eigen_file(args.eig, max_modes=36, nmax_expected=nmax_expected)
 
     write_eigenanm(outdir, eig)
