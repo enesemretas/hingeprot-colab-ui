@@ -270,7 +270,7 @@ def build_parts_with_restart_pair_removal(
         parts = [(0, n - 1)]
 
     short_frags = _merge_ranges(removed_frags, n)
-    return parts, short_frags, kept_hinges, discarded_hinges, removed_pairs
+    return parts, short_frags, kept_hinges, discarded_hinges
 
 
 # ------------------------- reporting -------------------------
@@ -295,7 +295,7 @@ def write_report(
                 continue
 
             hinge_entries = modes[mode][chain]  # [(seq_idx,resid),...]
-            parts_idx, short_frags, kept, discarded, removed_pairs = build_parts_with_restart_pair_removal(
+            parts_idx, short_frags, kept, discarded = build_parts_with_restart_pair_removal(
                 residue_list=residue_list,
                 hinge_entries=hinge_entries,
                 min_len=min_len,
