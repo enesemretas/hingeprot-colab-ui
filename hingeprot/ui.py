@@ -815,6 +815,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             loop_thr = "15"
             clust_thr = "14.0"
 
+            # prefer rigidparts for processHinges, fallback to hinge
+            parts_arg = f"{tag}.rigidparts.txt"
+            if not (os.path.exists(os.path.join(run_dir, parts_arg)) and os.path.getsize(os.path.join(run_dir, parts_arg)) > 0):
+                parts_arg = f"{tag}.hinge"
+
             def _moved1_candidates():
                 return [
                     f"{tag}.new.moved1.pdb", f"{tag}.moved1.pdb",
@@ -828,14 +833,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 ]
 
             if os.path.exists(PROCESSHINGES_PY):
-            def _run_processhinges(v1: str, v2: str):
-                _run(
-                    ["python3", PROCESSHINGES_PY, f"{tag}.new", parts_arg, v1, v2, loop_thr, clust_thr],
-                    cwd=run_dir,
-                    title="processHinges.py",
-                    allow_fail=True
-                )
-
+                def _run_processhinges(v1: str, v2: str):
+                    _run(
+                        ["python3", PROCESSHINGES_PY, f"{tag}.new", parts_arg, v1, v2, loop_thr, clust_thr],
+                        cwd=run_dir,
+                        title="processHinges.py",
+                        allow_fail=True
+                    )
 
                 # ANM pairs -> anment*.pdb
                 for i in range(1, 37, 2):
@@ -843,8 +847,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     v2 = f"{tag}.anm{i+1}vector"
                     if not (os.path.exists(os.path.join(run_dir, v1)) and os.path.exists(os.path.join(run_dir, v2))):
                         continue
+
                     _run_processhinges(v1, v2)
-                    # rename if produced
+
                     c1 = next((c for c in _moved1_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
                     c2 = next((c for c in _moved2_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
                     if c1:
@@ -867,6 +872,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 anment_files = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "anment*.pdb")))]
                 if anment_files:
                     _zip_make("panm136.zip", anment_files)
+            else:
+                _show_log("WARNING: processHinges.py not found; skipping moved PDB + mode1/mode2 outputs.")
+
 
             progress.value = progress.max
             progress.bar_style = "success"
