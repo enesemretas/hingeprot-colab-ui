@@ -238,8 +238,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     def _read_hinge_fractions_text(run_dir: str, tag: str) -> str:
         """
-        Show only hinge-fraction related lines, if present.
-        Priority: {tag}.new.hinges then {tag}.hinges then hinges.
+        Show only hinge-related lines, if present.
+        Priority: {tag}.hinge then hinges.
         """
         candidates = [
             os.path.join(run_dir, f"{tag}.hinge"),
@@ -247,7 +247,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         ]
         fp = next((p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 0), None)
         if not fp:
-            return "Hinge fractions file not found (expected: TAG.hinge)."
+            return "Hinge file not found (expected: TAG.hinge)."
 
         keep = []
         with open(fp, "r", encoding="utf-8", errors="ignore") as f:
@@ -256,14 +256,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 if not s:
                     continue
                 low = s.lower()
-                # conservative filters: keep likely “fractions” / “hinge” summary lines
-                if "fraction" in low or low.startswith("hinge") or "hinge residues" in low:
+                if "fraction" in low or low.startswith("hinge") or "hinge residues" in low or "crosscorrelation" in low:
                     keep.append(s)
 
         if not keep:
-            # fallback: show first ~40 lines (small)
             with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                keep = [ln.rstrip("\n") for ln in f.readlines()[:40]]
+                keep = [ln.rstrip("\n") for ln in f.readlines()[:60]]
 
         return "\n".join(keep)
 
@@ -412,7 +410,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     log_out = W.Output()
 
     # What you want to see
-    hinge_box = W.HTML('<div class="hp-pre">Hinge fractions will appear here after run.</div>')
+    hinge_box = W.HTML('<div class="hp-pre">Hinge text will appear here after run.</div>')
     downloads_wrap = W.VBox([], layout=W.Layout(gap="8px"))
 
     def _set_hinge_text(text: str):
@@ -578,7 +576,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     # ---------- actions ----------
     def on_load_clicked(_):
-        _set_hinge_text("Hinge fractions will appear here after run.")
+        _set_hinge_text("Hinge text will appear here after run.")
         downloads_wrap.children = ()
 
         try:
@@ -628,7 +626,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _set_hinge_text(f"ERROR: {e}")
 
     def on_run_clicked(_):
-        _set_hinge_text("Running... (hinge fractions will appear after completion)")
+        _set_hinge_text("Running... (hinge text will appear after completion)")
         downloads_wrap.children = ()
 
         try:
@@ -667,7 +665,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             # keep rescale file (extract.py may require it), but NO UI option
             RESCALE_DEFAULT = 1.0
 
-            # steps (no rescale UI)
+            # processHinges fixed parameters (your rule)
+            PROC_MIN_SEG_LEN = 15
+            PROC_BF_MAG = 10.0
+            PROC_WRITE_RIGIDPARTS = True
+
             progress.max = 11
             progress.value = 0
             progress.bar_style = "info"
@@ -711,19 +713,35 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     for rf in files_ok:
                         z.write(os.path.join(run_dir, rf), arcname=rf)
 
+            # ---- UPDATED candidates: support BOTH old and new processHinges naming ----
             def _moved1_candidates():
-                return [f"{tag}.new.moved1.pdb", f"{tag}.new.moved1.pdb.pdb", "new.moved1.pdb", "new.moved1.pdb.pdb"]
+                return [
+                    f"{tag}.new.moved1.pdb", f"{tag}.new.moved1.pdb.pdb",
+                    f"{tag}.moved1.pdb",     f"{tag}.moved1.pdb.pdb",
+                    "new.moved1.pdb", "new.moved1.pdb.pdb",
+                    "moved1.pdb", "moved1.pdb.pdb",
+                ]
 
             def _moved2_candidates():
-                return [f"{tag}.new.moved2.pdb", f"{tag}.new.moved2.pdb.pdb", "new.moved2.pdb", "new.moved2.pdb.pdb"]
+                return [
+                    f"{tag}.new.moved2.pdb", f"{tag}.new.moved2.pdb.pdb",
+                    f"{tag}.moved2.pdb",     f"{tag}.moved2.pdb.pdb",
+                    "new.moved2.pdb", "new.moved2.pdb.pdb",
+                    "moved2.pdb", "moved2.pdb.pdb",
+                ]
 
             def _loops_candidates():
-                return [f"{tag}.new.loops", "new.loops", f"{tag}.new.loops.txt", "new.loops.txt"]
+                return [
+                    f"{tag}.new.loops", f"{tag}.new.loops.txt",
+                    f"{tag}.loops",     f"{tag}.loops.txt",
+                    "new.loops", "new.loops.txt",
+                    "loops", "loops.txt",
+                ]
 
             # 1) params
             _write_text(os.path.join(run_dir, "gnmcutoff"), gnm_val)
             _write_text(os.path.join(run_dir, "anmcutoff"), anm_val)
-            _write_text(os.path.join(run_dir, "rescale"), RESCALE_DEFAULT)  # still required by extract.py
+            _write_text(os.path.join(run_dir, "rescale"), RESCALE_DEFAULT)
             progress.value += 1
 
             # 2) preprocess -> pdb
@@ -792,12 +810,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             # 9) coor2pdb.py
             _require_files(run_dir, ["pdb"], "coor2pdb.py precheck")
             _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "coor2pdb.py precheck")
+            # NOTE: keep as-is; your environment may generate 1..36. If not, you can change later.
             _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "coor2pdb.py precheck")
             _run(["python3", COOR2PDB_PY], cwd=run_dir, title="coor2pdb.py")
             progress.value += 1
 
             # 10) rename some + create zips + GNM_CROSSCOR.zip
-            # keep crosscorrslow* names (don’t rename) so your requested zip can find them
             rename_map = [
                 ("gnm1anmvector",  f"{tag}.1vector"),
                 ("gnm2anmvector",  f"{tag}.2vector"),
@@ -812,25 +830,29 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             for src, dst in rename_map:
                 _safe_rename(src, dst)
 
-            # ANM zip from anment*.pdb comes later (after processHinges)
-            # But keep old anm outputs zip too if you want:
+            # zip anm pdb outputs (if any)
             anm_pdbs = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "*anm.pdb")))]
             if anm_pdbs:
                 _zip_make("anm136.zip", anm_pdbs)
 
             gnm_cross_zip = _make_gnm_crosscor_zip(run_dir, tag)
-
             progress.value += 1
 
             # 11) processHinges + splitter + hingeaa + panm136.zip
-            # (Only runs if processHinges.py exists)
             loop_thr = "15"
             clust_thr = "14.0"
 
             if os.path.exists(PROCESSHINGES_PY):
-                def _run_processhinges(v1: str, v2: str):
-                    _run(["python3", PROCESSHINGES_PY, f"{tag}.new", f"{tag}.hinge", v1, v2, loop_thr, clust_thr],
-                         cwd=run_dir, title="processHinges.py")
+                def _run_processhinges(pdb_rel: str, hinge_rel: str, v1: str, v2: str):
+                    cmd = ["python3", PROCESSHINGES_PY, pdb_rel, hinge_rel, v1, v2, loop_thr, clust_thr]
+                    cmd += ["--min_seg_len", str(PROC_MIN_SEG_LEN), "--bf_mag", str(PROC_BF_MAG)]
+                    if PROC_WRITE_RIGIDPARTS:
+                        cmd += ["--write_rigidparts"]
+                    _run(cmd, cwd=run_dir, title="processHinges.py")
+
+                # NOTE: we keep using {tag}.new as pipeline expects.
+                pdb_rel_for_proc = f"{tag}.new"
+                hinge_rel_for_proc = f"{tag}.hinge"
 
                 # mode pairs -> anment*.pdb
                 for i in range(1, 37, 2):
@@ -838,23 +860,28 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     v2 = f"{tag}.anm{i+1}vector"
                     if not os.path.exists(os.path.join(run_dir, v1)) or not os.path.exists(os.path.join(run_dir, v2)):
                         continue
-                    _run_processhinges(v1, v2)
+
+                    _run_processhinges(pdb_rel_for_proc, hinge_rel_for_proc, v1, v2)
                     _safe_rename_any(_moved1_candidates(), f"anment{i}.pdb")
                     _safe_rename_any(_moved2_candidates(), f"anment{i+1}.pdb")
 
-                # GNM vectors (creates TAG.new.hinges, TAG.new.loops, TAG.new.moved1/2...)
+                # GNM vectors -> moved PDBs (for mode1.ent / mode2.ent)
                 if os.path.exists(os.path.join(run_dir, f"{tag}.1vector")) and os.path.exists(os.path.join(run_dir, f"{tag}.2vector")):
-                    _run_processhinges(f"{tag}.1vector", f"{tag}.2vector")
+                    _run_processhinges(pdb_rel_for_proc, hinge_rel_for_proc, f"{tag}.1vector", f"{tag}.2vector")
 
-                # rename loops
+                # rename loops (if created)
                 _safe_rename_any(_loops_candidates(), f"{tag}.loops")
 
-                # hingeaa (optional)
+                # hingeaa (optional) - keep as-is, but tolerant
                 if os.path.exists(HINGEAA_PY):
-                    hinges_in_rel = f"{tag}.new.hinges"
-                    hinges_in = os.path.join(run_dir, hinges_in_rel)
-                    if os.path.exists(hinges_in) and os.path.getsize(hinges_in) > 0:
-                        # try arg-mode then no-arg fallback
+                    # try a few possible inputs
+                    hinge_candidates = [
+                        f"{tag}.new.hinges",
+                        f"{tag}.hinges",
+                        "hingeout",
+                    ]
+                    hinges_in_rel = next((h for h in hinge_candidates if os.path.exists(os.path.join(run_dir, h))), None)
+                    if hinges_in_rel:
                         try:
                             _run(["python3", HINGEAA_PY, hinges_in_rel, "coordinates", "hingeout"], cwd=run_dir, title="hingeaa.py", allow_fail=False)
                             _safe_rename("hingeout", f"{tag}.hinges")
@@ -863,7 +890,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                             if os.path.exists(os.path.join(run_dir, "hingeout")):
                                 _safe_rename("hingeout", f"{tag}.hinges")
 
-                # splitter (optional): use latest moved1/moved2 after GNM processHinges
+                # splitter (optional) - use latest moved1/moved2 after GNM processHinges
                 moved1 = next((c for c in _moved1_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
                 moved2 = next((c for c in _moved2_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
 
@@ -877,7 +904,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         except Exception:
                             pass
 
-                # make requested mode1.ent/mode2.ent (plain names) from moved1/moved2 if present
+                # make requested mode1.ent/mode2.ent from latest moved1/moved2
                 moved1_now = next((c for c in _moved1_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
                 moved2_now = next((c for c in _moved2_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
                 if moved1_now:
@@ -893,7 +920,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             progress.value = progress.max
             progress.bar_style = "success"
 
-            # ---------- OUTPUT YOU WANT: hinge fractions + download buttons ----------
+            # ---------- OUTPUT: hinge text + download buttons ----------
             hinge_txt = _read_hinge_fractions_text(run_dir, tag)
             _set_hinge_text(hinge_txt)
 
@@ -909,7 +936,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 b.on_click(_cb)
                 buttons.append(b)
 
-            # Requested downloads
             _add_dl("Download ANM (panm136.zip)", "panm136.zip")
             _add_dl("Download mode1.ent", "mode1.ent")
             _add_dl("Download mode2.ent", "mode2.ent")
@@ -949,7 +975,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         state["pdb_path"] = None
         state["run_dir"] = None
 
-        _set_hinge_text("Hinge fractions will appear here after run.")
+        _set_hinge_text("Hinge text will appear here after run.")
         downloads_wrap.children = ()
 
     btn_load.on_click(on_load_clicked)
@@ -971,7 +997,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     ])
 
     output_card = W.VBox([
-        W.HTML('<div class="hp-card"><b>Hinge Fractions</b></div>'),
+        W.HTML('<div class="hp-card"><b>Hinge</b></div>'),
         hinge_box,
         W.HTML('<div class="hp-card"><b>Downloads</b></div>'),
         downloads_wrap,
