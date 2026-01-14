@@ -807,6 +807,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             gnm_cross_zip = _make_gnm_crosscor_zip(run_dir, tag)
             progress.value += 1
 
+            parts_arg = f"{tag}.rigidparts.txt"
+            if not (os.path.exists(os.path.join(run_dir, parts_arg)) and os.path.getsize(os.path.join(run_dir, parts_arg)) > 0):
+                parts_arg = f"{tag}.hinge"   # fallback (eski davranış)
 
             # 11) processHinges (optional) + outputs you want
             loop_thr = "15"
@@ -825,13 +828,14 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 ]
 
             if os.path.exists(PROCESSHINGES_PY):
-                def _run_processhinges(v1: str, v2: str):
-                    _run(
-                        ["python3", PROCESSHINGES_PY, f"{tag}.new", f"{tag}.hinge", v1, v2, loop_thr, clust_thr],
-                        cwd=run_dir,
-                        title="processHinges.py",
-                        allow_fail=True
-                    )
+            def _run_processhinges(v1: str, v2: str):
+                _run(
+                    ["python3", PROCESSHINGES_PY, f"{tag}.new", parts_arg, v1, v2, loop_thr, clust_thr],
+                    cwd=run_dir,
+                    title="processHinges.py",
+                    allow_fail=True
+                )
+
 
                 # ANM pairs -> anment*.pdb
                 for i in range(1, 37, 2):
