@@ -12,11 +12,10 @@
 #   - 1coor..10coor, 11coor..36coor
 #   - 1cross..10cross
 #
-# Notes:
-#   - The original FORTRAN later writes with format 31 but supplies fewer fields than the format expects.
-#     Here we append three trailing 0.000 values to complete the line.
-#   - The FORTRAN "SUEZ ADVA" block writes modes 17..42 into files 11coor..36coor, but it only read 36 modes.
-#     This Python version preserves file creation and writes zeros for mode indices beyond what is present.
+# Changes requested by user:
+#   - eigenanm: write the first 36 eigenvalues that are > 0 (skip zeros/negatives),
+#               and do NOT write any header/count line.
+#   - newcoordinat.mds: remove the last three trailing 0.000 columns.
 
 from __future__ import annotations
 
@@ -70,20 +69,6 @@ def parse_alpha_cor(alpha_path: str, max_size: int = 5000) -> AlphaCorData:
     with open(alpha_path, "r", encoding="utf-8", errors="replace") as f:
         for raw in f:
             line = raw.rstrip("\n")
-            # Parse by fixed columns (best effort) matching format 65
-            # A6:  1-6
-            # 1X:  7
-            # I4:  8-11  -> slice [7:11]
-            # 1X:  12
-            # A4:  13-16 -> slice [12:16]
-            # 1X:  17
-            # A3:  18-20 -> slice [17:20]
-            # 1X:  21
-            # A1:  22     -> slice [21:22]
-            # I4:  23-26  -> slice [22:26]
-            # A1:  27     -> slice [26:27]
-            # 3X:  28-30
-            # 3F8.3: 31-38, 39-46, 47-54 -> slices [30:38], [38:46], [46:54]
             k_str = _safe_slice(line, 7, 11).strip()
             if not k_str:
                 continue
@@ -123,7 +108,7 @@ def parse_alpha_cor(alpha_path: str, max_size: int = 5000) -> AlphaCorData:
                 max_k = k
 
     if max_k == 0:
-        max_k = 1  # avoid division by zero later, mimic “something exists”
+        max_k = 1
 
     return AlphaCorData(
         attyp=attyp,
@@ -193,12 +178,12 @@ def compute_centered_coords(data: AlphaCorData) -> Tuple[List[float], List[float
 class EigenData:
     nmax: int
     jres: int
-    w1: np.ndarray          # 1-based length (>=36+1)
-    v1: np.ndarray          # shape (nmax+1, n_modes+1), 1-based indices
+    w1: np.ndarray          # 1-based length (>=max_modes+1)
+    v1: np.ndarray          # shape (nmax+1, max_modes+1), 1-based indices
     n_modes: int
 
 
-def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | None = None) -> EigenData:
+def parse_eigen_file(eig_path: str, max_modes: int = 60, nmax_expected: int | None = None) -> EigenData:
     """
     Supports TWO formats:
 
@@ -207,17 +192,15 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
         - nmax on a fixed-column line
         - repeated blocks starting with 'vector '
 
-    (B) useblz.py "vwmatrix" style (numeric):
-        - typically starts with k lines of:  <eigenvalue> <residual_or_0>
-        - followed by eigenvector numbers (either row-major or column-major)
-        - no explicit nmax header: we infer nmax from alpha.cor via nmax_expected
+    (B) Numeric "vwmatrix" style (useblz.py-like):
+        - eigenpairs + eigenvectors as floats
+        - nmax inferred from alpha.cor via nmax_expected
     """
     with open(eig_path, "r", encoding="utf-8", errors="replace") as f:
         lines = [ln.rstrip("\n") for ln in f]
 
     # ---------- detect legacy 'vector ' blocks ----------
     if any((_safe_slice(ln, 0, 7) == "vector ") for ln in lines):
-        # ---- legacy parser (your old version), but keep it here ----
         idx = 0
         idx += 12
         if idx >= len(lines):
@@ -304,7 +287,7 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
 
         return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=n_modes)
 
-    # ---------- numeric "vwmatrix" parser (useblz.py output) ----------
+    # ---------- numeric "vwmatrix" parser ----------
     if nmax_expected is None or nmax_expected <= 0:
         raise RuntimeError(
             "Numeric eigen format detected, but nmax_expected was not provided. "
@@ -320,13 +303,9 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
                 pass
         return out
 
-    # Flatten ALL floats in file (robust: does NOT assume eigenvalue section line structure)
     all_floats: list[float] = []
-    floats_per_line: list[int] = []
     for ln in lines:
-        fl = parse_floats(ln)
-        floats_per_line.append(len(fl))
-        all_floats.extend(fl)
+        all_floats.extend(parse_floats(ln))
 
     nmax = int(nmax_expected)
     total = len(all_floats)
@@ -337,20 +316,14 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
     has_eigpairs = False
     vec_start = 0
 
-    # ---- tolerant inference ----
-    # Preferred: file contains eigenpairs (2 floats per mode) + eigenvectors (nmax floats per mode)
-    # Total should be k*(nmax+2), but some writers add a tiny footer (e.g., +2 floats).
     if total >= (nmax + 2):
         k_floor = total // (nmax + 2)
         rem = total - k_floor * (nmax + 2)
-
-        # accept small remainder (common: rem=2)
         if k_floor >= 1 and rem <= 32:
             k_total = int(k_floor)
             has_eigpairs = True
             vec_start = 2 * k_total
 
-    # Fallback: maybe vectors only (no eigenpairs), allow small remainder too
     if k_total is None and total >= nmax:
         k_floor = total // nmax
         rem = total - k_floor * nmax
@@ -365,13 +338,11 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
             f"Try checking upperhessian.vwmatrix formatting."
         )
 
-    # Extract eigenvalues (if present)
     if has_eigpairs:
-        eigvals = [float(all_floats[2*i]) for i in range(k_total)]
+        eigvals = [float(all_floats[2 * i]) for i in range(k_total)]
     else:
         eigvals = [0.0] * k_total
 
-    # Extract eigenvector floats (IGNORE any trailing extras beyond what we need)
     need_vec = nmax * k_total
     vec_floats = all_floats[vec_start:vec_start + need_vec]
     if len(vec_floats) < need_vec:
@@ -380,31 +351,21 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
             f"(nmax={nmax}, k={k_total}, vec_start={vec_start}, total_floats={total})"
         )
 
-    # Build candidate matrices (nmax x k_total) in two plausible orderings:
-    #  - Row-major: rows are DOFs, columns are modes (common text dump)
-    #  - Column-major: all components of mode1, then mode2, ... (Fortran-ish)
     V_row = np.array(vec_floats, dtype=float).reshape((nmax, k_total), order="C")
     V_col = np.array(vec_floats, dtype=float).reshape((k_total, nmax), order="C").T
 
     def score_matrix(V: np.ndarray) -> float:
-        # lower is better
         m = min(10, V.shape[1])
         X = V[:, :m]
-
         norms = np.linalg.norm(X, axis=0)
         norm_err = float(np.mean(np.abs(norms - 1.0)))
-
-        # orthogonality error (normalized Gram off-diagonal)
-        # avoid divide-by-zero
         norms_safe = np.where(norms == 0.0, 1.0, norms)
         Xn = X / norms_safe
         G = Xn.T @ Xn
         off = G - np.eye(m)
         ortho_err = float(np.mean(np.abs(off)))
-
         return norm_err + ortho_err
 
-    # Choose the interpretation that looks more like normalized orthogonal eigenvectors
     s_row = score_matrix(V_row)
     s_col = score_matrix(V_col)
     V_best = V_row if s_row <= s_col else V_col
@@ -424,10 +385,18 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
 
 
 def write_eigenanm(outdir: str, eig: EigenData) -> None:
+    """
+    Write eigenanm as:
+      index   eigenvalue
+    Taking DIRECTLY the first 36 eigenvalues (no filtering).
+    No header/count line is written.
+    """
     path = os.path.join(outdir, "eigenanm")
     with open(path, "w", encoding="utf-8") as f:
-        for i in range(1, min(36, len(eig.w1) - 1) + 1):
-            f.write(f"{i:4d}  {eig.w1[i]:8.4f}\n")
+        # Always write 1..36 (if missing, w1 entries remain 0.0)
+        for i in range(1, 37):
+            val = float(eig.w1[i]) if i < len(eig.w1) else 0.0
+            f.write(f"{i:4d}  {val:8.4f}\n")
 
 
 def fmt_9798(j: int, x: float, y: float, z: float, mag: float) -> str:
@@ -457,37 +426,29 @@ def write_coor_and_cross(outdir: str, eig: EigenData) -> None:
     k9 = k1 + 8
     k10 = k1 + 9
 
-    # Open coor files
     coor_handles: Dict[int, Tuple[int, object]] = {}
-
-    # 1coor..10coor correspond to modes k1..k10
     for idx_file, mode in enumerate([k1, k2, k3, k4, k5, k6, k7, k8, k9, k10], start=1):
         fh = open(os.path.join(outdir, f"{idx_file}coor"), "w", encoding="utf-8")
         coor_handles[idx_file] = (mode, fh)
 
-    # 11coor..36coor: FORTRAN uses ss = k1 + ss_unit - 1101 where ss_unit=1111..1136 => ss=17..42
     suez_handles: Dict[int, Tuple[int, object]] = {}
     for file_no in range(11, 37):
         fh = open(os.path.join(outdir, f"{file_no}coor"), "w", encoding="utf-8")
-        # Map file_no -> ss_unit: 1111 corresponds to file 11, ..., 1136 to file 36
         ss_unit = 1100 + file_no
-        ss = k1 + ss_unit - 1101
+        ss = k1 + ss_unit - 1101  # 17..42
         suez_handles[file_no] = (ss, fh)
 
-    # Open cross files 1cross..10cross correspond to modes 7..16 (k=fileindex-67 for fileindex 74..83)
     cross_handles: Dict[int, Tuple[int, object]] = {}
     for cross_idx, mode in enumerate(range(7, 17), start=1):
         fh = open(os.path.join(outdir, f"{cross_idx}cross"), "w", encoding="utf-8")
         cross_handles[cross_idx] = (mode, fh)
 
-    # Write coor files
     for j in range(1, jres + 1):
         ix = 3 * j - 2
         iy = 3 * j - 1
         iz = 3 * j
 
-        # 1..10coor
-        for file_no, (mode, fh) in coor_handles.items():
+        for _, (mode, fh) in coor_handles.items():
             if 1 <= mode <= n_modes and iz <= eig.nmax:
                 x = float(v1[ix, mode])
                 y = float(v1[iy, mode])
@@ -497,8 +458,7 @@ def write_coor_and_cross(outdir: str, eig: EigenData) -> None:
             mag = math.sqrt(x * x + y * y + z * z)
             fh.write(fmt_9798(j, x, y, z, mag))
 
-        # 11..36coor (SUEZ ADVA)
-        for file_no, (mode, fh) in suez_handles.items():
+        for _, (mode, fh) in suez_handles.items():
             if 1 <= mode <= n_modes and iz <= eig.nmax:
                 x = float(v1[ix, mode])
                 y = float(v1[iy, mode])
@@ -508,10 +468,8 @@ def write_coor_and_cross(outdir: str, eig: EigenData) -> None:
             mag = math.sqrt(x * x + y * y + z * z)
             fh.write(fmt_9798(j, x, y, z, mag))
 
-    # Write cross files (cosine similarity between displacement vectors for each mode)
-    for cross_idx, (mode, fh) in cross_handles.items():
+    for _, (mode, fh) in cross_handles.items():
         if not (1 <= mode <= n_modes):
-            # still create file, but no content
             continue
 
         for i in range(1, jres + 1):
@@ -534,7 +492,6 @@ def write_coor_and_cross(outdir: str, eig: EigenData) -> None:
                     dumn = float(np.dot(vi, vj) / (mag1 * mag2))
                 fh.write(fmt_9799(i, j, dumn))
 
-    # Close all
     for _, (_, fh) in coor_handles.items():
         fh.close()
     for _, (_, fh) in suez_handles.items():
@@ -543,18 +500,21 @@ def write_coor_and_cross(outdir: str, eig: EigenData) -> None:
         fh.close()
 
 
-def write_newcoordinat(outdir: str, data: AlphaCorData, xxnew: List[float], yynew: List[float], zznew: List[float], jres: int) -> None:
+def write_newcoordinat(
+    outdir: str,
+    data: AlphaCorData,
+    xxnew: List[float],
+    yynew: List[float],
+    zznew: List[float],
+    jres: int
+) -> None:
     """
-    Mimic FORTRAN write with format 31:
-      31 format(a4,3x,I4,1x,a4,1x,a3,1x,a1,i4,a1,f11.3,f8.3,f8.3,
-     :1x,f5.2,1x,i4,1x,f4.3,1x,f4.3,1x,f4.3)
-
-    FORTRAN provided fewer args than required; we append 0.000 0.000 0.000.
+    Write newcoordinat.mds.
+    User request: remove the last three trailing 0.000 columns.
     """
     path = os.path.join(outdir, "newcoordinat.mds")
     with open(path, "w", encoding="utf-8") as f:
         for j in range(1, jres + 1):
-            # Safe access if j exceeds alpha arrays
             at = data.attyp[j] if j < len(data.attyp) else ""
             rt = data.restyp[j] if j < len(data.restyp) else ""
             ch = data.chnam[j] if j < len(data.chnam) else " "
@@ -574,9 +534,6 @@ def write_newcoordinat(outdir: str, data: AlphaCorData, xxnew: List[float], yyne
                 f"{x:11.3f}{y:8.3f}{z:8.3f}"
                 f" {1.00:5.2f}"
                 f" {ix:4d}"
-                f" {0.0:4.3f}"
-                f" {0.0:4.3f}"
-                f" {0.0:4.3f}"
                 f"\n"
             )
             f.write(line)
@@ -593,24 +550,18 @@ def main() -> None:
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
-    # Read alpha.cor and compute centered coords
     alpha = parse_alpha_cor(args.alpha, max_size=5000)
     xxnew, yynew, zznew = compute_centered_coords(alpha)
 
-    # Read eigen file (unit 44)
     nmax_expected = 3 * alpha.resnum
+
+    # IMPORTANT: read more than 36 modes so we can skip zero modes and still write 36 positive eigenvalues if available
     eig = parse_eigen_file(args.eig, max_modes=36, nmax_expected=nmax_expected)
 
-    # Write eigenanm
     write_eigenanm(outdir, eig)
-
-    # Write 1coor..36coor and 1cross..10cross
     write_coor_and_cross(outdir, eig)
 
-    # Re-read residue numbers into ind (as FORTRAN does)
     reread_residue_numbers(args.alpha, alpha)
-
-    # Write newcoordinat.mds (jres comes from eigen file: nmax/3)
     write_newcoordinat(outdir, alpha, xxnew, yynew, zznew, eig.jres)
 
 
