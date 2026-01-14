@@ -39,8 +39,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     SPLITTER_PY      = os.path.join(HINGEPROT_DIR, "splitter.py")
     HINGEAA_PY       = os.path.join(HINGEPROT_DIR, "hingeaa.py")
 
-    # NEW: rigid parts reporter (your script)
-    RIGIDPARTS_PY    = os.path.join(HINGEPROT_DIR, "rigidparts_report.py")
 
     os.makedirs(runs_root, exist_ok=True)
 
