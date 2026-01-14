@@ -10,10 +10,11 @@ import uuid
 import shutil
 import glob
 import zipfile
+from typing import Dict, List, Tuple, Optional
 
 import requests
 import ipywidgets as W
-from IPython.display import display, clear_output
+from IPython.display import display
 
 
 def launch(runs_root: str = "/content/hingeprot_runs"):
@@ -37,9 +38,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     PROCESSHINGES_PY = os.path.join(HINGEPROT_DIR, "processHinges.py")
     SPLITTER_PY      = os.path.join(HINGEPROT_DIR, "splitter.py")
     HINGEAA_PY       = os.path.join(HINGEPROT_DIR, "hingeaa.py")
-
-    # NEW: rigid parts reporter (your script)
-    RIGIDPARTS_PY    = os.path.join(HINGEPROT_DIR, "rigidparts_report.py")
 
     os.makedirs(runs_root, exist_ok=True)
 
@@ -239,31 +237,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         row = W.HBox([lbl, toggle, value_box], layout=W.Layout(align_items="center", gap="12px"))
         return row, get_value
 
-    def _read_summary_text(run_dir: str, tag: str) -> str:
-        """
-        Prefer TAG.rigidparts.txt (full report).
-        Fallback to TAG.hinge / hinges if report not produced.
-        """
-        candidates = [
-            os.path.join(run_dir, f"{tag}.rigidparts.txt"),
-            os.path.join(run_dir, f"{tag}.hinge"),
-            os.path.join(run_dir, "hinges"),
-        ]
-        fp = next((p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 0), None)
-        if not fp:
-            return "Summary file not found (expected: TAG.rigidparts.txt or TAG.hinge)."
-
-        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.read().splitlines()
-
-        # keep it safe for UI: cap very long files
-        if len(lines) > 600:
-            head = lines[:300]
-            tail = lines[-300:]
-            lines = head + ["", "[... truncated ...]", ""] + tail
-
-        return "\n".join(lines)
-
     def _make_gnm_crosscor_zip(run_dir: str, tag: str) -> str | None:
         rels = []
         for i in range(1, 11):
@@ -293,6 +266,268 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     def _colab_download(abs_path: str):
         from google.colab import files  # colab-only
         files.download(abs_path)
+
+    # ---------- NEW: rigid parts report generator (inline, no extra .py needed) ----------
+
+    def _read_residue_order_from_new(new_path: str) -> Dict[str, List[str]]:
+        """
+        TAG.new is usually PDB-like. We try split() first, fallback to fixed columns.
+        Returns residues_by_chain[chain] = [resid_str ...] in order.
+        """
+        residues_by_chain: Dict[str, List[str]] = {}
+        last = None
+
+        with open(new_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                    continue
+
+                parts = line.split()
+                chain = None
+                resid = None
+
+                if len(parts) >= 6:
+                    chain = parts[4].strip() or "A"
+                    resid = parts[5].strip()
+                else:
+                    chain = (line[21] if len(line) > 21 else "A").strip() or "A"
+                    resid_num = line[22:26].strip()
+                    icode = (line[26] if len(line) > 26 else " ").strip()
+                    resid = resid_num + (icode if icode else "")
+
+                if not resid:
+                    continue
+
+                key = (chain, resid)
+                if key == last:
+                    continue
+                residues_by_chain.setdefault(chain, []).append(resid)
+                last = key
+
+        return residues_by_chain
+
+    def _parse_hinge_file_for_modes(hinge_path: str) -> Dict[int, Dict[str, List[str]]]:
+        """
+        Parses TAG.hinge (or TAG.hinges) with headers like:
+          ----> crosscorrelation : 1st slowest mode
+        and lines like:
+          <rowIndex> <resid> <chain>
+        We always take:
+          - chain = last token if len==1 else default A
+          - resid = token before chain (or parts[1] fallback)
+        """
+        modes: Dict[int, Dict[str, List[str]]] = {}
+        mode: Optional[int] = None
+
+        def _mode_from_header(s: str) -> Optional[int]:
+            low = s.lower()
+            if "1st" in low or "mode 1" in low:
+                return 1
+            if "2nd" in low or "mode 2" in low:
+                return 2
+            m = re.search(r"(\d+)", low)
+            return int(m.group(1)) if m else None
+
+        with open(hinge_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("---->"):
+                    mode = _mode_from_header(line)
+                    continue
+                if mode is None:
+                    continue
+
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+
+                chain = "A"
+                if len(parts) >= 1 and len(parts[-1]) == 1:
+                    chain = parts[-1]
+
+                resid_token = None
+                if len(parts) >= 3:
+                    resid_token = parts[-2]  # usually second last
+                elif len(parts) >= 2:
+                    resid_token = parts[1]   # fallback
+
+                if resid_token is None:
+                    continue
+
+                resid_token = resid_token.strip()
+                if not resid_token:
+                    continue
+
+                modes.setdefault(mode, {}).setdefault(chain, []).append(resid_token)
+
+        return modes
+
+    def _filter_hinges_by_minlen(
+        residue_list: List[str],
+        hinge_resids: List[str],
+        min_len: int,
+    ) -> Tuple[List[str], List[Tuple[int, int]]]:
+        """
+        Hinge acceptance is based on residue ORDER index difference (not numeric resid gaps).
+        If start->hinge or prev_kept->hinge segment length < min_len -> discard hinge and record as short fragment.
+        """
+        idx_map = {rid: i for i, rid in enumerate(residue_list)}
+
+        hinge_idxs: List[int] = []
+        for r in hinge_resids:
+            if r in idx_map:
+                hinge_idxs.append(idx_map[r])
+
+        hinge_idxs = sorted(set(hinge_idxs))  # ensure monotonic / unique
+
+        kept_idxs: List[int] = []
+        short_frags: List[Tuple[int, int]] = []
+
+        prev_kept = -1
+        for idx in hinge_idxs:
+            seg_len = idx - prev_kept  # start->hinge: idx-(-1)=idx+1
+            if seg_len < min_len:
+                short_frags.append((prev_kept + 1, idx))
+            else:
+                kept_idxs.append(idx)
+                prev_kept = idx
+
+        # tail rule (optional but useful): if last hinge leaves a too-short tail, drop it and record tail
+        if kept_idxs:
+            last_idx = kept_idxs[-1]
+            tail_len = (len(residue_list) - 1) - last_idx
+            if tail_len < min_len:
+                short_frags.append((last_idx + 1, len(residue_list) - 1))
+                kept_idxs = kept_idxs[:-1]
+
+        # merge adjacent/overlapping short fragments
+        short_frags = sorted(short_frags)
+        merged: List[Tuple[int, int]] = []
+        for a, b in short_frags:
+            if a > b:
+                a, b = b, a
+            if not merged:
+                merged.append((a, b))
+            else:
+                pa, pb = merged[-1]
+                if a <= pb + 1:
+                    merged[-1] = (pa, max(pb, b))
+                else:
+                    merged.append((a, b))
+
+        merged = [(a, b) for a, b in merged if 0 <= a <= b < len(residue_list)]
+        kept = [residue_list[i] for i in kept_idxs]
+        return kept, merged
+
+    def _build_rigid_parts(residue_list: List[str], kept_hinges: List[str]) -> List[Tuple[str, str]]:
+        idx_map = {rid: i for i, rid in enumerate(residue_list)}
+        kept_idxs = sorted({idx_map[r] for r in kept_hinges if r in idx_map})
+
+        parts: List[Tuple[str, str]] = []
+        start = 0
+        for idx in kept_idxs:
+            parts.append((residue_list[start], residue_list[idx]))
+            start = idx + 1
+        if start <= len(residue_list) - 1:
+            parts.append((residue_list[start], residue_list[-1]))
+        return parts
+
+    def _write_rigidparts_report(
+        out_path: str,
+        tag: str,
+        residues_by_chain: Dict[str, List[str]],
+        modes: Dict[int, Dict[str, List[str]]],
+        min_len: int = 15,
+    ) -> None:
+        lines: List[str] = []
+
+        for mode in [1, 2]:
+            if mode not in modes:
+                continue
+
+            lines.append(f"----> Slowest mode {mode}: {tag}")
+            for chain in sorted(modes[mode].keys()):
+                residue_list = residues_by_chain.get(chain)
+                if not residue_list:
+                    lines.append(f"(Chain {chain} not found in {tag}.new; skipping)")
+                    continue
+
+                hinge_resids = modes[mode][chain]
+                kept, short_frags = _filter_hinges_by_minlen(residue_list, hinge_resids, min_len=min_len)
+                parts = _build_rigid_parts(residue_list, kept)
+
+                lines.append(f"# of rigid parts: {len(parts)}")
+                lines.append("Rigid Part No\tResidues")
+                for i, (a, b) in enumerate(parts, start=1):
+                    lines.append(f"{i}\t\t{a}-{b}")
+
+                if kept:
+                    # append chain label to match sample style (57A 269A)
+                    lines.append("Hinge residues: " + " ".join([f"{r}{chain}" for r in kept]))
+                else:
+                    lines.append("Hinge residues: (none)")
+
+                if short_frags:
+                    lines.append("")
+                    lines.append("Short Flexible Fragments:")
+                    for i, (ai, bi) in enumerate(short_frags, start=1):
+                        lines.append(f"{i}\t\t{residue_list[ai]}-{residue_list[bi]}")
+                lines.append("")  # blank line between chains
+
+            lines.append("")  # blank line between modes
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).rstrip() + "\n")
+
+    def _make_rigidparts_txt(run_dir: str, tag: str, min_len: int = 15) -> Optional[str]:
+        """
+        Creates TAG.rigidparts.txt using TAG.new + TAG.hinge (or TAG.hinges if exists).
+        Returns basename if created.
+        """
+        newp = os.path.join(run_dir, f"{tag}.new")
+        if not (os.path.exists(newp) and os.path.getsize(newp) > 0):
+            return None
+
+        # hinge source priority:
+        # 1) TAG.hinges (if hingeaa created)
+        # 2) TAG.hinge
+        # 3) hinges (raw)
+        hinge_candidates = [
+            os.path.join(run_dir, f"{tag}.hinges"),
+            os.path.join(run_dir, f"{tag}.hinge"),
+            os.path.join(run_dir, "hinges"),
+        ]
+        hinge_p = next((p for p in hinge_candidates if os.path.exists(p) and os.path.getsize(p) > 0), None)
+        if not hinge_p:
+            return None
+
+        residues_by_chain = _read_residue_order_from_new(newp)
+        modes = _parse_hinge_file_for_modes(hinge_p)
+        out_name = f"{tag}.rigidparts.txt"
+        out_path = os.path.join(run_dir, out_name)
+        _write_rigidparts_report(out_path, tag, residues_by_chain, modes, min_len=min_len)
+        return out_name
+
+    def _read_rigidparts_text(run_dir: str, tag: str) -> str:
+        """
+        UI display: prefer TAG.rigidparts.txt; fallback to TAG.hinge if missing.
+        """
+        rp = os.path.join(run_dir, f"{tag}.rigidparts.txt")
+        if os.path.exists(rp) and os.path.getsize(rp) > 0:
+            return Path(rp).read_text(encoding="utf-8", errors="replace")
+
+        # fallback: show hinge file (what you currently see)
+        cand = [
+            os.path.join(run_dir, f"{tag}.hinges"),
+            os.path.join(run_dir, f"{tag}.hinge"),
+            os.path.join(run_dir, "hinges"),
+        ]
+        hp = next((p for p in cand if os.path.exists(p) and os.path.getsize(p) > 0), None)
+        if not hp:
+            return "Rigid-parts report not found, and hinge file not found."
+        return Path(hp).read_text(encoding="utf-8", errors="replace")
 
     # ---------- UI ----------
     css = W.HTML(r"""
@@ -404,12 +639,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     log_out = W.Output()
 
     # What you want to see
-    hinge_box = W.HTML('<div class="hp-pre">Report will appear here after run.</div>')
+    report_box = W.HTML('<div class="hp-pre">Rigid parts report will appear here after run.</div>')
     downloads_wrap = W.VBox([], layout=W.Layout(gap="8px"))
 
-    def _set_hinge_text(text: str):
+    def _set_report_text(text: str):
         safe = (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        hinge_box.value = f'<div class="hp-pre">{safe}</div>'
+        report_box.value = f'<div class="hp-pre">{safe}</div>'
 
     state = {
         "pdb_path": None,
@@ -570,7 +805,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     # ---------- actions ----------
     def on_load_clicked(_):
-        _set_hinge_text("Report will appear here after run.")
+        _set_report_text("Rigid parts report will appear here after run.")
         downloads_wrap.children = ()
 
         try:
@@ -617,10 +852,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 state["_syncing"] = False
 
         except Exception as e:
-            _set_hinge_text(f"ERROR: {e}")
+            _set_report_text(f"ERROR: {e}")
 
     def on_run_clicked(_):
-        _set_hinge_text("Running... (report will appear after completion)")
+        _set_report_text("Running... (report will appear after completion)")
         downloads_wrap.children = ()
 
         try:
@@ -656,7 +891,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             gnm_val = float(get_gnm_cut())
             anm_val = float(get_anm_cut())
 
-            RESCALE_DEFAULT = 1.0
+            RESCALE_DEFAULT = 1.0  # no UI option
 
             progress.max = 11
             progress.value = 0
@@ -678,6 +913,12 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 except Exception:
                     return False
 
+            def _safe_rename_any(src_candidates: list[str], dst: str) -> bool:
+                for s in src_candidates:
+                    if os.path.exists(os.path.join(run_dir, s)):
+                        return _safe_rename(s, dst)
+                return False
+
             def _zip_make(zip_name: str, rel_files: list[str]):
                 zp = os.path.join(run_dir, zip_name)
                 files_ok = []
@@ -694,6 +935,15 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 with zipfile.ZipFile(zp, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
                     for rf in files_ok:
                         z.write(os.path.join(run_dir, rf), arcname=rf)
+
+            def _moved1_candidates():
+                return [f"{tag}.new.moved1.pdb", f"{tag}.new.moved1.pdb.pdb", "new.moved1.pdb", "new.moved1.pdb.pdb"]
+
+            def _moved2_candidates():
+                return [f"{tag}.new.moved2.pdb", f"{tag}.new.moved2.pdb.pdb", "new.moved2.pdb", "new.moved2.pdb.pdb"]
+
+            def _loops_candidates():
+                return [f"{tag}.new.loops", "new.loops", f"{tag}.new.loops.txt", "new.loops.txt"]
 
             # 1) params
             _write_text(os.path.join(run_dir, "gnmcutoff"), gnm_val)
@@ -771,7 +1021,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _run(["python3", COOR2PDB_PY], cwd=run_dir, title="coor2pdb.py")
             progress.value += 1
 
-            # 10) rename + zips
+            # 10) rename outputs + zips + GNM_CROSSCOR.zip + rigidparts report
             rename_map = [
                 ("gnm1anmvector",  f"{tag}.1vector"),
                 ("gnm2anmvector",  f"{tag}.2vector"),
@@ -786,74 +1036,67 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             for src, dst in rename_map:
                 _safe_rename(src, dst)
 
-            # Zip ANM pdb outputs (if any)
             anm_pdbs = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "*anm.pdb")))]
             if anm_pdbs:
                 _zip_make("anm136.zip", anm_pdbs)
 
             gnm_cross_zip = _make_gnm_crosscor_zip(run_dir, tag)
+
+            # --- NEW: build TAG.rigidparts.txt here (so UI can print correct report) ---
+            _make_rigidparts_txt(run_dir, tag, min_len=15)
+
             progress.value += 1
 
-            # 10.5) NEW: build rigid parts report (hinges + short flexible fragments)
-            # This fixes your missing text problem.
-            if os.path.exists(RIGIDPARTS_PY):
-                # create TAG.rigidparts.txt
-                _run(
-                    ["python3", RIGIDPARTS_PY, tag,
-                     "--hinge", f"{tag}.hinge",
-                     "--new", f"{tag}.new",
-                     "--min-len", "15",
-                     "--out", f"{tag}.rigidparts.txt"],
-                    cwd=run_dir,
-                    title="rigidparts_report.py",
-                    allow_fail=True
-                )
-            else:
-                _show_log("WARNING: rigidparts_report.py not found; will not print rigid parts/short fragments.")
-
-            # 11) processHinges (optional) + outputs you want
+            # 11) processHinges + splitter + hingeaa + panm136.zip
             loop_thr = "15"
             clust_thr = "14.0"
-
-            def _moved1_candidates():
-                return [
-                    f"{tag}.new.moved1.pdb", f"{tag}.moved1.pdb",
-                    "new.moved1.pdb", "moved1.pdb",
-                ]
-
-            def _moved2_candidates():
-                return [
-                    f"{tag}.new.moved2.pdb", f"{tag}.moved2.pdb",
-                    "new.moved2.pdb", "moved2.pdb",
-                ]
 
             if os.path.exists(PROCESSHINGES_PY):
                 def _run_processhinges(v1: str, v2: str):
                     _run(
                         ["python3", PROCESSHINGES_PY, f"{tag}.new", f"{tag}.hinge", v1, v2, loop_thr, clust_thr],
                         cwd=run_dir,
-                        title="processHinges.py",
-                        allow_fail=True
+                        title="processHinges.py"
                     )
 
-                # ANM pairs -> anment*.pdb
                 for i in range(1, 37, 2):
                     v1 = f"{tag}.anm{i}vector"
                     v2 = f"{tag}.anm{i+1}vector"
-                    if not (os.path.exists(os.path.join(run_dir, v1)) and os.path.exists(os.path.join(run_dir, v2))):
+                    if not os.path.exists(os.path.join(run_dir, v1)) or not os.path.exists(os.path.join(run_dir, v2)):
                         continue
                     _run_processhinges(v1, v2)
-                    # rename if produced
-                    c1 = next((c for c in _moved1_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
-                    c2 = next((c for c in _moved2_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
-                    if c1:
-                        _safe_rename(c1, f"anment{i}.pdb")
-                    if c2:
-                        _safe_rename(c2, f"anment{i+1}.pdb")
+                    _safe_rename_any(_moved1_candidates(), f"anment{i}.pdb")
+                    _safe_rename_any(_moved2_candidates(), f"anment{i+1}.pdb")
 
-                # GNM vectors -> moved PDBs -> mode1.ent/mode2.ent
                 if os.path.exists(os.path.join(run_dir, f"{tag}.1vector")) and os.path.exists(os.path.join(run_dir, f"{tag}.2vector")):
                     _run_processhinges(f"{tag}.1vector", f"{tag}.2vector")
+
+                _safe_rename_any(_loops_candidates(), f"{tag}.loops")
+
+                if os.path.exists(HINGEAA_PY):
+                    hinges_in_rel = f"{tag}.new.hinges"
+                    hinges_in = os.path.join(run_dir, hinges_in_rel)
+                    if os.path.exists(hinges_in) and os.path.getsize(hinges_in) > 0:
+                        try:
+                            _run(["python3", HINGEAA_PY, hinges_in_rel, "coordinates", "hingeout"], cwd=run_dir, title="hingeaa.py", allow_fail=False)
+                            _safe_rename("hingeout", f"{tag}.hinges")
+                        except Exception:
+                            _run(["python3", HINGEAA_PY], cwd=run_dir, title="hingeaa.py", allow_fail=True)
+                            if os.path.exists(os.path.join(run_dir, "hingeout")):
+                                _safe_rename("hingeout", f"{tag}.hinges")
+
+                moved1 = next((c for c in _moved1_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
+                moved2 = next((c for c in _moved2_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
+
+                if moved1 and moved2 and os.path.exists(SPLITTER_PY):
+                    shutil.copyfile(os.path.join(run_dir, moved1), os.path.join(run_dir, "modeent1"))
+                    shutil.copyfile(os.path.join(run_dir, moved2), os.path.join(run_dir, "modeent2"))
+                    _run(["python3", SPLITTER_PY], cwd=run_dir, title="splitter.py", allow_fail=True)
+                    for fp in glob.glob(os.path.join(run_dir, "modeent*")):
+                        try:
+                            os.remove(fp)
+                        except Exception:
+                            pass
 
                 moved1_now = next((c for c in _moved1_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
                 moved2_now = next((c for c in _moved2_candidates() if os.path.exists(os.path.join(run_dir, c))), None)
@@ -862,7 +1105,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 if moved2_now:
                     shutil.copyfile(os.path.join(run_dir, moved2_now), os.path.join(run_dir, "mode2.ent"))
 
-                # panm136.zip
                 anment_files = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "anment*.pdb")))]
                 if anment_files:
                     _zip_make("panm136.zip", anment_files)
@@ -870,11 +1112,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             progress.value = progress.max
             progress.bar_style = "success"
 
-            # ---------- OUTPUT: show report (rigid parts + hinges + short fragments) ----------
-            report_txt = _read_summary_text(run_dir, tag)
-            _set_hinge_text(report_txt)
+            # ---------- OUTPUT YOU WANT: rigid parts report + download buttons ----------
+            report_txt = _read_rigidparts_text(run_dir, tag)
+            _set_report_text(report_txt)
 
-            # ---------- DOWNLOAD buttons ----------
             buttons = []
 
             def _add_dl(label: str, relpath: str):
@@ -894,13 +1135,13 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 _add_dl("Download GNM_CROSSCOR.zip", gnm_cross_zip)
 
             if not buttons:
-                buttons = [W.HTML("<i>No downloadable outputs found yet.</i>")]
+                buttons = [W.HTML("<i>No downloadable outputs found yet (panm136.zip / mode1.ent / mode2.ent / GNM_CROSSCOR.zip).</i>")]
 
             downloads_wrap.children = tuple(buttons)
 
         except Exception as e:
             progress.bar_style = "danger"
-            _set_hinge_text(f"ERROR: {e}\n\n(If you want debug logs back, tell me and I’ll show log_out.)")
+            _set_report_text(f"ERROR: {e}\n\n(If you want debug logs back, tell me and I’ll show log_out.)")
             downloads_wrap.children = ()
 
     def on_clear_clicked(_):
@@ -926,7 +1167,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         state["pdb_path"] = None
         state["run_dir"] = None
 
-        _set_hinge_text("Report will appear here after run.")
+        _set_report_text("Rigid parts report will appear here after run.")
         downloads_wrap.children = ()
 
     btn_load.on_click(on_load_clicked)
@@ -949,7 +1190,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
     output_card = W.VBox([
         W.HTML('<div class="hp-card"><b>Rigid Parts / Hinges / Short Flexible Fragments</b></div>'),
-        hinge_box,
+        report_box,
         W.HTML('<div class="hp-card"><b>Downloads</b></div>'),
         downloads_wrap,
     ])
