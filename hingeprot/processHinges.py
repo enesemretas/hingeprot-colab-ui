@@ -20,7 +20,7 @@ class ResKey:
 @dataclass(frozen=True)
 class HingePoint:
     mode: int          # 1 or 2
-    seq_idx: int       # 1-based residue-order index (from hinge file col-1)
+    seq_idx: int       # 1-based residue-order index (from hinge file col-1). 0 => unknown
     chain: str
     resnum: int
     icode: str
@@ -163,13 +163,17 @@ def _split_res_token(tok: str) -> Tuple[Optional[int], str]:
 
 def parse_hinge_file(hinge_path: str) -> Dict[int, List[HingePoint]]:
     """
-    Parses Fortran-like hinge output:
-      ----> crosscorrelation : 1st slowest mode
-         47   57A  A
-         257  267   A
-    Column1: seq index (1-based)
-    Column2: residue number (+ optional insertion code)
-    Column3: chain ID
+    Accepts BOTH formats inside a mode section:
+
+    (A) 3 columns:
+        <seq_idx> <resid> <chain>
+        26   39   A
+
+    (B) 2 columns:
+        <resid> <chain>
+        39   A
+
+    seq_idx is used if present; otherwise seq_idx=0 and we later match by resnum/icode.
     """
     out: Dict[int, List[HingePoint]] = {1: [], 2: []}
     mode: Optional[int] = None
@@ -196,17 +200,24 @@ def parse_hinge_file(hinge_path: str) -> Dict[int, List[HingePoint]]:
             if len(parts) < 2:
                 continue
 
-            try:
-                seq_idx = int(float(parts[0]))
-            except Exception:
-                continue
+            if len(parts) >= 3:
+                # seq_idx resid chain
+                try:
+                    seq_idx = int(float(parts[0]))
+                except Exception:
+                    continue
+                res_tok = parts[1]
+                chain = (parts[2].strip()[:1] or "A")
+            else:
+                # resid chain
+                seq_idx = 0
+                res_tok = parts[0]
+                chain = (parts[1].strip()[:1] or "A")
 
-            res_tok = parts[1]
             resnum, icode = _split_res_token(res_tok)
             if resnum is None:
                 continue
 
-            chain = (parts[2].strip()[:1] if len(parts) >= 3 else "A") or "A"
             out[mode].append(HingePoint(mode=mode, seq_idx=seq_idx, chain=chain, resnum=resnum, icode=icode))
 
     if not out[1] and not out[2]:
@@ -220,7 +231,7 @@ def _res_label(k: ResKey) -> str:
     return f"{k.resnum}{ic}{k.chain}"
 
 
-# ------------------------- CORE: "short fragments yok say" hinge temizleme -------------------------
+# ------------------------- CORE: "kısa aralık varsa iki hinge de yok" -------------------------
 
 def clean_hinges_ignore_short_fragments(
     chain_keys: List[ResKey],
@@ -228,60 +239,63 @@ def clean_hinges_ignore_short_fragments(
     min_seg_len: int,
 ) -> Tuple[List[int], List[Tuple[ResKey, ResKey]]]:
     """
-    Amaç: short fragment (min_seg_len'den kısa segment) oluşturacak hinge boundary'leri
-    sanki hiç yokmuş gibi kaldırmak.
+    Senin istediğin mantık:
 
-    Kural (HingeProt'a yakın):
-      - Baş segment (0..pos[0]) kısa ise -> pos[0] hinge'ini kaldır
-      - İki hinge arası segment (pos[i]+1..pos[i+1]) kısa ise -> ERKEN olan hinge (pos[i]) kaldır
-        (böylece boundary daha geç hinge'e kayar; kısa aralıkta işaret flip oluşmaz)
-      - Kuyruk segment (pos[-1]+1..end) kısa ise -> son hinge pos[-1] kaldır
+    - Eğer ardışık iki hinge arasında oluşacak segment uzunluğu < min_seg_len ise,
+      o iki hinge de "yokmuş gibi" silinir. (işaret flip'i hiç yaşanmamış sayılır)
+    - Baş segment (0..first_hinge) kısa ise -> first_hinge silinir
+    - Kuyruk segment (last_hinge+1..end) kısa ise -> last_hinge silinir
+    - Bu işlem, silmeler yeni komşuluklar doğurabileceği için iteratif yapılır.
 
     Returns:
-      cleaned_positions: kalan hinge boundary indeksleri (0-based; hinge residue soldaki segmentin sonudur)
-      short_pairs: yok sayılan kısa aralıkları raporlamak için (left_res, right_res)
+      cleaned_positions: kalan hinge boundary indeksleri (0-based)
+      short_pairs: hangi hinge-çiftleri (ve/veya baş/kuyruk) yüzünden silme olduğunu raporlamak için (left_res,right_res)
     """
     N = len(chain_keys)
     pos = sorted(set([p for p in hinge_positions if 0 <= p < N]))
-    sff: List[Tuple[ResKey, ResKey]] = []
+    short_pairs_idx: List[Tuple[int, int]] = []
 
     if N == 0 or not pos:
-        return pos, sff
+        return pos, []
 
     while True:
-        changed = False
-
-        # start segment: 0..pos[0] length = pos[0]+1
-        if pos and (pos[0] + 1) < min_seg_len:
-            sff.append((chain_keys[0], chain_keys[pos[0]]))
-            pos.pop(0)
-            changed = True
-            continue
-
-        # between hinges: (pos[i]+1 .. pos[i+1]) length = pos[i+1] - pos[i]
-        removed = False
-        for i in range(len(pos) - 1):
-            if (pos[i + 1] - pos[i]) < min_seg_len:
-                # short fragment bounded by these two hinges -> early hinge yok say
-                sff.append((chain_keys[pos[i]], chain_keys[pos[i + 1]]))
-                pos.pop(i)  # remove earlier hinge
-                removed = True
-                changed = True
-                break
-        if removed:
-            continue
-
-        # tail segment: (pos[-1]+1 .. N-1) length = N-1 - pos[-1]
-        if pos and ((N - 1 - pos[-1]) < min_seg_len):
-            sff.append((chain_keys[pos[-1]], chain_keys[-1]))
-            pos.pop(-1)
-            changed = True
-            continue
-
-        if not changed:
+        bad: set[int] = set()
+        if not pos:
             break
 
-    return pos, sff
+        # start segment length = pos[0] + 1
+        if (pos[0] + 1) < min_seg_len:
+            bad.add(pos[0])
+            short_pairs_idx.append((0, pos[0]))
+
+        # between hinges segment length = pos[i] - pos[i-1]
+        for i in range(1, len(pos)):
+            if (pos[i] - pos[i - 1]) < min_seg_len:
+                bad.add(pos[i - 1])
+                bad.add(pos[i])
+                short_pairs_idx.append((pos[i - 1], pos[i]))
+
+        # tail segment length = (N-1) - pos[-1]
+        if ((N - 1) - pos[-1]) < min_seg_len:
+            bad.add(pos[-1])
+            short_pairs_idx.append((pos[-1], N - 1))
+
+        if not bad:
+            break
+
+        pos = [p for p in pos if p not in bad]
+
+    # deduplicate + map to ResKey pairs
+    uniq = []
+    seen = set()
+    for a, b in short_pairs_idx:
+        key = (min(a, b), max(a, b))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(key)
+
+    short_pairs: List[Tuple[ResKey, ResKey]] = [(chain_keys[a], chain_keys[b]) for a, b in uniq]
+    return pos, short_pairs
 
 
 def build_segments_from_hinges(N: int, hinges_pos: List[int]) -> List[Tuple[int, int]]:
@@ -312,16 +326,20 @@ def build_bfactors_from_hinges(
     hinges: Dict[int, List[HingePoint]],
     min_seg_len: int = 15,
     bmag: float = 10.0,
-) -> Tuple[Dict[int, Dict[ResKey, float]], Dict[int, Dict[str, List[Tuple[int, int]]]], Dict[int, Dict[str, List[str]]]]:
+) -> Tuple[
+    Dict[int, Dict[ResKey, float]],
+    Dict[int, Dict[str, List[Tuple[int, int]]]],
+    Dict[int, Dict[str, List[str]]]
+]:
     """
     Returns:
       bfac_by_mode: {mode -> {ResKey -> bfac}}
-      report_by_mode: {mode -> dict}
-         report_by_mode[mode][chain] = [(start_resnum,end_resnum), ...] final rigid parts
-         report_by_mode[mode][f"{chain}__SFF"] = [(start_resnum,end_resnum), ...] ignored short fragments (diagnostic)
-      hinge_report: {mode -> dict}
-         hinge_report[mode][f"{chain}__KEPT"] = [labels...]   kept hinge boundaries
-         hinge_report[mode][f"{chain}__IGNORED"] = [labels...] ignored hinge residues (optional)
+      report_by_mode:
+         report_by_mode[mode][chain] = [(start_resnum,end_resnum), ...] rigid parts
+         report_by_mode[mode][f"{chain}__SFF"] = [(left_resnum,right_resnum), ...] short-cluster pairs (diagnostic)
+      hinge_report:
+         hinge_report[mode][f"{chain}__KEPT"] = [labels...]
+         hinge_report[mode][f"{chain}__IGNORED"] = [labels...]
     """
     chains = sorted(set(k.chain for k in ca_keys))
     chain_keys: Dict[str, List[ResKey]] = {ch: [k for k in ca_keys if k.chain == ch] for ch in chains}
@@ -338,7 +356,7 @@ def build_bfactors_from_hinges(
     hinge_report: Dict[int, Dict[str, List[str]]] = {1: {}, 2: {}}
 
     for mode in (1, 2):
-        hinges_mode = sorted(hinges.get(mode, []), key=lambda h: h.seq_idx)
+        hinges_mode = sorted(hinges.get(mode, []), key=lambda h: (h.seq_idx if h.seq_idx > 0 else 10**9, h.resnum))
 
         for ch in chains:
             keys = chain_keys[ch]
@@ -348,30 +366,28 @@ def build_bfactors_from_hinges(
 
             # candidate hinge positions in chain coords
             cand_chainpos: List[int] = []
-            cand_labels: List[str] = []
 
             for hp in hinges_mode:
                 if hp.chain != ch:
                     continue
 
-                gpos = hp.seq_idx - 1
-                if 0 <= gpos < len(ca_keys) and ca_keys[gpos].chain == ch:
-                    cp = chain_pos_of_global[ch][gpos]
-                    cand_chainpos.append(cp)
-                    cand_labels.append(_res_label(keys[cp]))
-                else:
-                    # fallback: match by resnum/icode
-                    found = False
-                    for ci, kk in enumerate(keys):
-                        if kk.resnum == hp.resnum and (hp.icode.strip() == "" or kk.icode.strip() == hp.icode.strip()):
-                            cand_chainpos.append(ci)
-                            cand_labels.append(_res_label(keys[ci]))
-                            found = True
-                            break
-                    if not found:
-                        pass
+                # 1) Prefer seq_idx mapping if available and consistent
+                if hp.seq_idx > 0:
+                    gpos = hp.seq_idx - 1
+                    if 0 <= gpos < len(ca_keys) and ca_keys[gpos].chain == ch:
+                        cand_chainpos.append(chain_pos_of_global[ch][gpos])
+                        continue
 
-            # ignore short fragments by removing hinge boundaries that create them
+                # 2) Fallback: match by resnum/icode in this chain
+                for ci, kk in enumerate(keys):
+                    if kk.resnum == hp.resnum:
+                        if (hp.icode.strip() == "") or (kk.icode.strip() == hp.icode.strip()):
+                            cand_chainpos.append(ci)
+                            break
+
+            cand_chainpos = sorted(set([p for p in cand_chainpos if 0 <= p < N]))
+
+            # === FIXED HERE: short pair => BOTH hinges are ignored ===
             cleaned_pos, short_pairs = clean_hinges_ignore_short_fragments(
                 chain_keys=keys,
                 hinge_positions=cand_chainpos,
@@ -386,13 +402,13 @@ def build_bfactors_from_hinges(
                 report_by_mode[mode][f"{ch}__SFF"] = [(a.resnum, b.resnum) for a, b in short_pairs]
 
             kept_set = set(cleaned_pos)
-            all_set = set([p for p in cand_chainpos if 0 <= p < N])
+            all_set = set(cand_chainpos)
             ignored_set = sorted(list(all_set - kept_set))
 
             hinge_report[mode][f"{ch}__KEPT"] = [_res_label(keys[p]) for p in sorted(list(kept_set))]
             hinge_report[mode][f"{ch}__IGNORED"] = [_res_label(keys[p]) for p in ignored_set]
 
-            # assign B-factors by FINAL rigid parts (flip only at remaining hinges)
+            # assign B-factors by FINAL rigid parts (flip only at cleaned_pos boundaries)
             idxs_global = global_indices_by_chain[ch]
             for si, (a, b) in enumerate(segs):
                 sign = 1.0 if (si % 2 == 0) else -1.0
@@ -427,27 +443,15 @@ def write_rigidparts_report(
 
                 f.write("Hinge residues (KEPT boundaries): " + (" ".join(kept) if kept else "(none)") + "\n")
                 if ign:
-                    f.write("Hinge residues (IGNORED due to short fragments): " + " ".join(ign) + "\n")
+                    f.write("Hinge residues (IGNORED; treated as if they never existed): " + " ".join(ign) + "\n")
 
                 sff = report_by_mode.get(mode, {}).get(f"{ch}__SFF", [])
                 if sff:
-                    f.write("Short fragments (treated as if hinges did not exist; no sign flip inside):\n")
+                    f.write("Short-cluster pairs that caused IGNORE (diagnostic):\n")
                     for (a, b) in sff:
                         f.write(f"{ch}:{a}-{b}\n")
 
                 f.write("\n")
-
-            # raw hinge list (input)
-            hinge_list = []
-            for hp in sorted(hinges.get(mode, []), key=lambda x: x.seq_idx):
-                gpos = hp.seq_idx - 1
-                if 0 <= gpos < len(ca_keys):
-                    hinge_list.append(_res_label(ca_keys[gpos]))
-                else:
-                    ic = (hp.icode.strip() or "")
-                    hinge_list.append(f"{hp.resnum}{ic}{hp.chain}")
-            if hinge_list:
-                f.write("Raw hinge list (input): " + " ".join(hinge_list) + "\n")
 
             f.write("\n")
 
@@ -517,7 +521,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("loop_thr", type=int)  # backward-compatible (unused here)
     ap.add_argument("clustering_dist_thr", type=float)
 
-    ap.add_argument("--min_seg_len", type=int, default=15, help="Min segment length; short fragments => ignore hinge(s).")
+    ap.add_argument("--min_seg_len", type=int, default=15,
+                    help="If any segment induced by consecutive hinges is shorter than this, BOTH hinges are ignored.")
     ap.add_argument("--bf_mag", type=float, default=10.0, help="Magnitude of B-factor values (+/-).")
     ap.add_argument("--write_rigidparts", action="store_true", help="Write <pdb>.rigidparts.txt report.")
 
