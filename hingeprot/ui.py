@@ -32,6 +32,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     ANM3_PY          = os.path.join(HINGEPROT_DIR, "anm3.py")
     EXTRACT_PY       = os.path.join(HINGEPROT_DIR, "extract.py")
     COOR2PDB_PY      = os.path.join(HINGEPROT_DIR, "coor2pdb.py")
+    RIGIDPARTS_PY = os.path.join(HINGEPROT_DIR, "rigid_parts_from_hinge.py")
 
     # Optional python ports (if present)
     PROCESSHINGES_PY = os.path.join(HINGEPROT_DIR, "processHinges.py")
@@ -786,6 +787,20 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             for src, dst in rename_map:
                 _safe_rename(src, dst)
 
+            if os.path.exists(RIGIDPARTS_PY):
+                _run(
+                    ["python3", RIGIDPARTS_PY, tag,
+                     "--hinge", f"{tag}.hinge",
+                     "--new", f"{tag}.new",
+                     "--min-len", "15",
+                     "--out", f"{tag}.rigidparts.txt"],
+                    cwd=run_dir,
+                    title="rigid_parts_from_hinge.py",
+                    allow_fail=False   # burada False kalsın ki hata olursa UI "hinges"e düşmesin
+                )
+            else:
+                _show_log("WARNING: rigid_parts_from_hinge.py not found; skipping rigid parts report.")
+
             # Zip ANM pdb outputs (if any)
             anm_pdbs = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "*anm.pdb")))]
             if anm_pdbs:
@@ -890,8 +905,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _add_dl("Download ANM (panm136.zip)", "panm136.zip")
             _add_dl("Download mode1.ent", "mode1.ent")
             _add_dl("Download mode2.ent", "mode2.ent")
+            _add_dl("Download rigid parts report", f"{tag}.rigidparts.txt")
             if gnm_cross_zip:
                 _add_dl("Download GNM_CROSSCOR.zip", gnm_cross_zip)
+            
 
             if not buttons:
                 buttons = [W.HTML("<i>No downloadable outputs found yet.</i>")]
