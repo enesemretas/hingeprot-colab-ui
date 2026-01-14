@@ -192,14 +192,15 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
         - nmax on a fixed-column line
         - repeated blocks starting with 'vector '
 
-    (B) Numeric "vwmatrix" style (useblz.py-like):
-        - eigenpairs + eigenvectors as floats
-        - nmax inferred from alpha.cor via nmax_expected
+    (B) useblz.py ".vwmatrixd" style:
+        - first non-empty line:   nteig  N
+        - next nteig lines:       eigenvalue  residual
+        - then eigenvectors stream (column-major: ((x(i,j), i=1..N), j=1..nteig))
     """
     with open(eig_path, "r", encoding="utf-8", errors="replace") as f:
         lines = [ln.rstrip("\n") for ln in f]
 
-    # ---------- detect legacy 'vector ' blocks ----------
+    # ---------- legacy 'vector ' blocks ----------
     if any((_safe_slice(ln, 0, 7) == "vector ") for ln in lines):
         idx = 0
         idx += 12
@@ -287,115 +288,117 @@ def parse_eigen_file(eig_path: str, max_modes: int = 36, nmax_expected: int | No
 
         return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=n_modes)
 
-    # ---------- numeric "vwmatrix" parser ----------
-    if nmax_expected is None or nmax_expected <= 0:
+    # ---------- useblz ".vwmatrixd" parser ----------
+    # Find first non-empty line as header
+    h = None
+    h_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip():
+            h = ln.strip()
+            h_idx = i
+            break
+    if h is None:
+        raise RuntimeError("Eigen file is empty.")
+
+    htoks = h.split()
+    if len(htoks) < 2:
+        raise RuntimeError(f"Cannot parse vwmatrix header: {h!r}")
+
+    # Header: nteig N
+    try:
+        nteig_total = int(float(htoks[0]))
+        N = int(float(htoks[1]))
+    except ValueError:
+        raise RuntimeError(f"Cannot parse vwmatrix header ints: {h!r}")
+
+    if nmax_expected is not None and nmax_expected > 0 and int(nmax_expected) != N:
+        # mismatch is usually a pipeline issue; don't hard-fail unless you want to.
+        # print warning to stdout for visibility
+        print(f"Warning: vwmatrix header N={N} but expected nmax={nmax_expected}")
+
+    # Next nteig_total lines: eigenvalue residual
+    eigvals_all = []
+    residuals_all = []
+    idx = (h_idx + 1)
+
+    def _parse_two_floats(line: str) -> tuple[float, float] | None:
+        toks = line.replace("D", "E").split()
+        if len(toks) < 2:
+            return None
+        try:
+            return float(toks[0]), float(toks[1])
+        except ValueError:
+            return None
+
+    while idx < len(lines) and len(eigvals_all) < nteig_total:
+        ln = lines[idx].strip()
+        idx += 1
+        if not ln:
+            continue
+        pair = _parse_two_floats(ln)
+        if pair is None:
+            continue
+        lam, res = pair
+        eigvals_all.append(lam)
+        residuals_all.append(res)
+
+    if len(eigvals_all) < nteig_total:
         raise RuntimeError(
-            "Numeric eigen format detected, but nmax_expected was not provided. "
-            "Pass nmax_expected=3*n_residues from alpha.cor."
+            f"vwmatrix eigenpair section too short: expected {nteig_total}, got {len(eigvals_all)}"
         )
 
-    def parse_floats(ln: str) -> list[float]:
-        out = []
-        for tok in ln.strip().split():
+    # Remaining lines: eigenvector stream tokens
+    vec_tokens: list[float] = []
+    for ln in lines[idx:]:
+        if not ln.strip():
+            continue
+        for tok in ln.replace("D", "E").split():
             try:
-                out.append(float(tok))
+                vec_tokens.append(float(tok))
             except ValueError:
                 pass
-        return out
 
-    all_floats: list[float] = []
-    for ln in lines:
-        all_floats.extend(parse_floats(ln))
-
-    nmax = int(nmax_expected)
-    total = len(all_floats)
-    if total == 0:
-        raise RuntimeError("Eigen file contains no numeric data.")
-
-    k_total = None
-    has_eigpairs = False
-    vec_start = 0
-
-    if total >= (nmax + 2):
-        k_floor = total // (nmax + 2)
-        rem = total - k_floor * (nmax + 2)
-        if k_floor >= 1 and rem <= 32:
-            k_total = int(k_floor)
-            has_eigpairs = True
-            vec_start = 2 * k_total
-
-    if k_total is None and total >= nmax:
-        k_floor = total // nmax
-        rem = total - k_floor * nmax
-        if k_floor >= 1 and rem <= 32:
-            k_total = int(k_floor)
-            has_eigpairs = False
-            vec_start = 0
-
-    if k_total is None or k_total <= 0:
+    need = N * nteig_total
+    if len(vec_tokens) < need:
         raise RuntimeError(
-            f"Cannot infer k from numeric eigen file. total_floats={total}, nmax={nmax}. "
-            f"Try checking upperhessian.vwmatrix formatting."
+            f"vwmatrix eigenvector stream too short: need {need} floats (=N*nteig), got {len(vec_tokens)}"
         )
+    vec_tokens = vec_tokens[:need]
 
-    if has_eigpairs:
-        eigvals = [float(all_floats[2 * i]) for i in range(k_total)]
-    else:
-        eigvals = [0.0] * k_total
+    # Reconstruct eigvec matrix exactly as writer did: column-major stream
+    V_full = np.array(vec_tokens, dtype=float).reshape((N, nteig_total), order="F")
 
-    need_vec = nmax * k_total
-    vec_floats = all_floats[vec_start:vec_start + need_vec]
-    if len(vec_floats) < need_vec:
-        raise RuntimeError(
-            f"Eigenvector data too short. Need {need_vec} floats (=nmax*k), got {len(vec_floats)}. "
-            f"(nmax={nmax}, k={k_total}, vec_start={vec_start}, total_floats={total})"
-        )
-
-    V_row = np.array(vec_floats, dtype=float).reshape((nmax, k_total), order="C")
-    V_col = np.array(vec_floats, dtype=float).reshape((k_total, nmax), order="C").T
-
-    def score_matrix(V: np.ndarray) -> float:
-        m = min(10, V.shape[1])
-        X = V[:, :m]
-        norms = np.linalg.norm(X, axis=0)
-        norm_err = float(np.mean(np.abs(norms - 1.0)))
-        norms_safe = np.where(norms == 0.0, 1.0, norms)
-        Xn = X / norms_safe
-        G = Xn.T @ Xn
-        off = G - np.eye(m)
-        ortho_err = float(np.mean(np.abs(off)))
-        return norm_err + ortho_err
-
-    s_row = score_matrix(V_row)
-    s_col = score_matrix(V_col)
-    V_best = V_row if s_row <= s_col else V_col
-
-    modes_to_read = min(max_modes, k_total)
+    modes_to_read = min(max_modes, nteig_total)
 
     w1 = np.zeros(max_modes + 1, dtype=float)
-    for i in range(1, modes_to_read + 1):
-        w1[i] = float(eigvals[i - 1])
-
-    v1 = np.zeros((nmax + 1, max_modes + 1), dtype=float)
     for m in range(1, modes_to_read + 1):
-        v1[1:nmax + 1, m] = V_best[:, m - 1]
+        # IMPORTANT: skip header line already; eigenvalues start from the first eigenpair line
+        w1[m] = float(eigvals_all[m - 1])
 
-    jres = nmax // 3
-    return EigenData(nmax=nmax, jres=jres, w1=w1, v1=v1, n_modes=modes_to_read)
+    v1 = np.zeros((N + 1, max_modes + 1), dtype=float)
+    for m in range(1, modes_to_read + 1):
+        v1[1:N + 1, m] = V_full[:, m - 1]
+
+    jres = N // 3
+    return EigenData(nmax=N, jres=jres, w1=w1, v1=v1, n_modes=modes_to_read)
 
 
 def write_eigenanm(outdir: str, eig: EigenData) -> None:
     """
-    eigenanm format (changed as requested):
-      - exactly first 36 eigenvalues
-      - NO header/count line
-      - NO index column: only eigenvalue per line
+    eigenanm format (as requested):
+      - first column: row index (right-aligned width 4)
+      - after index: 4 spaces if eigenvalue >= 0, else 3 spaces
+      - then eigenvalue with 4 decimals (no scientific)
+    Example:
+       1    0.0000
+      10    0.0620
     """
     path = os.path.join(outdir, "eigenanm")
     with open(path, "w", encoding="utf-8") as f:
         for i in range(1, 37):
             val = float(eig.w1[i]) if i < len(eig.w1) else 0.0
-            f.write(f"{val:8.4f}\n")
+            gap = "    " if val >= 0.0 else "   "
+            f.write(f"{i:4d}{gap}{val:.4f}\n")
 
 
 def fmt_9798(j: int, x: float, y: float, z: float, mag: float) -> str:
