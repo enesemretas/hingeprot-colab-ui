@@ -807,22 +807,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             gnm_cross_zip = _make_gnm_crosscor_zip(run_dir, tag)
             progress.value += 1
 
-            # 10.5) NEW: build rigid parts report (hinges + short flexible fragments)
-            # This fixes your missing text problem.
-            if os.path.exists(RIGIDPARTS_PY):
-                # create TAG.rigidparts.txt
-                _run(
-                    ["python3", RIGIDPARTS_PY, tag,
-                     "--hinge", f"{tag}.hinge",
-                     "--new", f"{tag}.new",
-                     "--min-len", "15",
-                     "--out", f"{tag}.rigidparts.txt"],
-                    cwd=run_dir,
-                    title="rigidparts_report.py",
-                    allow_fail=True
-                )
-            else:
-                _show_log("WARNING: rigidparts_report.py not found; will not print rigid parts/short fragments.")
 
             # 11) processHinges (optional) + outputs you want
             loop_thr = "15"
