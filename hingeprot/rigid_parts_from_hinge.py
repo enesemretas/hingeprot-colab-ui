@@ -63,9 +63,9 @@ def read_residue_order_from_new(new_path: Path) -> Dict[str, List[str]]:
 
 def parse_hinge_file(hinge_path: Path) -> Dict[int, Dict[str, List[Tuple[int, str]]]]:
     """
-    Parses a .hinge/.hinges file with sections:
+    Parses a .hinge file with sections:
       ----> crosscorrelation : 1st slowest mode
-      <seq_idx> <resid> <chain>   (or extra cols; we take first as seq_idx, last two as resid & chain)
+      <seq_idx> <resid> <chain>
 
     Returns:
       modes[mode_number][chain] = [(seq_idx, resid), ...]  (seq_idx is 1-based)
@@ -99,7 +99,6 @@ def parse_hinge_file(hinge_path: Path) -> Dict[int, Dict[str, List[Tuple[int, st
             if len(parts) < 3:
                 continue
 
-            # seq_idx: first col
             try:
                 seq_idx = int(float(parts[0]))
             except Exception:
@@ -112,7 +111,7 @@ def parse_hinge_file(hinge_path: Path) -> Dict[int, Dict[str, List[Tuple[int, st
 
             modes.setdefault(mode, {}).setdefault(chain, []).append((seq_idx, resid_token))
 
-    # ensure stable ordering
+    # stable ordering by seq_idx
     for m in modes:
         for ch in modes[m]:
             modes[m][ch].sort(key=lambda x: x[0])
@@ -154,63 +153,53 @@ def build_parts_with_restart_pair_removal(
     residue_list: List[str],
     hinge_entries: List[Tuple[int, str]],  # [(seq_idx,resid), ...] sorted by seq_idx
     min_len: int,
-) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[str], List[str], List[Tuple[str, str, int]]]:
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
     """
-    İstenen algoritma:
+    İstenen algoritma (raporda sadece rigid parts + short fragments göstereceğiz):
 
     - Mesafe: hinge dosyasındaki satır numarası farkı (seq_idx farkı).
     - Short fragment: komşu iki hinge için (seq_idx[j] - seq_idx[i]) < min_len.
-    - Seçim: tüm short çiftler arasından EN KÜÇÜK mesafeli çifti seç.
+    - Seçim: tüm short çiftler arasından EN KÜÇÜK seq_idx-gap çifti seç.
       (tie-break: daha küçük seq_idx ile başlayan)
     - Kaldırma: seçilen çiftin İKİ hinge'i de kaldırılır.
     - Restart: her kaldırmadan sonra tarama EN BAŞTAN yapılır.
 
-    Not: boundary pozisyonu mapping önceliği:
-      1) chain-local index = seq_idx - 1 (range içindeyse)
-      2) değilse resid string -> residue_list index fallback
+    Boundary pozisyonu (chain içi index) bulma:
+      - Önce resid token'ı residue_list içinde arar (daha güvenli).
+      - Bulamazsa seq_idx-1 fallback (uygunsa).
 
     Returns:
-      parts_idx: final rigid parts as index ranges (contiguous) [0..h1], [h1+1..h2], ...
-      short_frags: removed short segments as index ranges (h_left+1 .. h_right) merged for readability
-      kept_hinges: kept hinge residues (resid tokens) in ascending boundary order
-      discarded_hinges: discarded hinge residues (resid tokens) in removal order summary (sorted by position)
-      removed_pairs: list of removed hinge pairs as (resid1,resid2, seq_gap)
+      parts_idx: final rigid parts index ranges
+      short_frags: removed short fragments as index ranges (between removed hinge-pairs) merged
     """
     n = len(residue_list)
     if n == 0:
-        return [], [], [], [], []
+        return [], []
 
     idx_map = {rid: i for i, rid in enumerate(residue_list)}
 
-    # Build candidate hinge objects with:
-    # - seq_idx (1-based from file)
-    # - pos (0-based in residue_list; prefer seq_idx-1)
-    # - resid token
-    cand: List[Dict[str, Any]] = []
+    hinges: List[Dict[str, Any]] = []
     for seq_idx, resid in hinge_entries:
-        pos = seq_idx - 1
-        if 0 <= pos < n:
-            # trust seq_idx mapping (chain-local)
-            cand.append({"seq": seq_idx, "pos": pos, "resid": resid})
+        if resid in idx_map:
+            pos = idx_map[resid]
         else:
-            # fallback: resid string
-            if resid in idx_map:
-                cand.append({"seq": seq_idx, "pos": idx_map[resid], "resid": resid})
+            pos = seq_idx - 1
+            if not (0 <= pos < n):
+                continue
+        hinges.append({"seq": int(seq_idx), "pos": int(pos), "resid": str(resid)})
 
-    # deduplicate by position (keep smallest seq if duplicates)
+    # deduplicate by position (keep smallest seq)
     tmp: Dict[int, Dict[str, Any]] = {}
-    for h in cand:
+    for h in hinges:
         p = int(h["pos"])
         if p not in tmp or int(h["seq"]) < int(tmp[p]["seq"]):
             tmp[p] = h
+
     hinges = sorted(tmp.values(), key=lambda x: int(x["seq"]))
 
-    removed_pairs: List[Tuple[str, str, int]] = []
     removed_frags: List[Tuple[int, int]] = []
-    removed_pos: set[int] = set()
 
-    def _recompute_and_pick_pair(hs: List[Dict[str, Any]]) -> Optional[int]:
-        """Return index i for pair (i,i+1) to remove; choose minimal gap < min_len, tie by earliest."""
+    def _pick_pair_index(hs: List[Dict[str, Any]]) -> Optional[int]:
         best_i: Optional[int] = None
         best_gap: Optional[int] = None
         for i in range(len(hs) - 1):
@@ -219,28 +208,21 @@ def build_parts_with_restart_pair_removal(
                 if best_gap is None or gap < best_gap:
                     best_gap = gap
                     best_i = i
-                elif gap == best_gap and best_i is not None:
-                    # tie-break: earlier seq (already ordered, so keep earlier i)
-                    pass
+                # tie-break: earlier i already wins
         return best_i
 
-    # main iterative removal with restart
+    # iterative remove with restart
     while True:
         if len(hinges) < 2:
             break
-        i = _recompute_and_pick_pair(hinges)
+        i = _pick_pair_index(hinges)
         if i is None:
             break
 
         h1 = hinges[i]
         h2 = hinges[i + 1]
-        gap = int(h2["seq"]) - int(h1["seq"])
 
-        removed_pairs.append((str(h1["resid"]), str(h2["resid"]), gap))
-        removed_pos.add(int(h1["pos"]))
-        removed_pos.add(int(h2["pos"]))
-
-        # short fragment segment is between the two boundaries: (pos_left+1 .. pos_right)
+        # short fragment is between boundaries: (pos_left+1 .. pos_right)
         a = int(h1["pos"]) + 1
         b = int(h2["pos"])
         if a <= b:
@@ -249,15 +231,11 @@ def build_parts_with_restart_pair_removal(
         # remove BOTH hinges
         del hinges[i + 1]
         del hinges[i]
-        # restart automatically by continuing loop
+        # restart automatically
 
-    # final kept boundary positions
     kept_pos = sorted({int(h["pos"]) for h in hinges if 0 <= int(h["pos"]) < n})
-    kept_hinges = [residue_list[p] for p in kept_pos]
 
-    discarded_hinges = [residue_list[p] for p in sorted(list(removed_pos)) if 0 <= p < n]
-
-    # build rigid parts from kept boundaries (each boundary is end of left part)
+    # build rigid parts from kept boundaries
     parts: List[Tuple[int, int]] = []
     start = 0
     for p in kept_pos:
@@ -270,10 +248,10 @@ def build_parts_with_restart_pair_removal(
         parts = [(0, n - 1)]
 
     short_frags = _merge_ranges(removed_frags, n)
-    return parts, short_frags, kept_hinges, discarded_hinges
+    return parts, short_frags
 
 
-# ------------------------- reporting -------------------------
+# ------------------------- reporting (ONLY rigid parts + short fragments) -------------------------
 
 def write_report(
     out_path: Path,
@@ -294,8 +272,8 @@ def write_report(
                 lines.append("")
                 continue
 
-            hinge_entries = modes[mode][chain]  # [(seq_idx,resid),...]
-            parts_idx, short_frags, kept, discarded = build_parts_with_restart_pair_removal(
+            hinge_entries = modes[mode][chain]
+            parts_idx, short_frags = build_parts_with_restart_pair_removal(
                 residue_list=residue_list,
                 hinge_entries=hinge_entries,
                 min_len=min_len,
@@ -306,19 +284,9 @@ def write_report(
             for i, (a, b) in enumerate(parts_idx, start=1):
                 lines.append(f"{i}\t\t{residue_list[a]}-{residue_list[b]}")
 
-            lines.append("Hinge residues (kept): " + (" ".join(kept) if kept else "(none)"))
-            if discarded:
-                lines.append("Discarded hinge residues (removed by short-pair rule): " + " ".join(discarded))
-
-            if removed_pairs:
-                lines.append("")
-                lines.append("Removed short hinge-pairs (picked by smallest seq_idx gap; restart after each removal):")
-                for k, (r1, r2, gap) in enumerate(removed_pairs, start=1):
-                    lines.append(f"{k}\t\t{r1}-{r2}\t(seq_gap={gap})")
-
             if short_frags:
                 lines.append("")
-                lines.append("Short fragments (between removed hinge-pairs; treated as if sign never flipped):")
+                lines.append("Short fragments:")
                 for k, (a, b) in enumerate(short_frags, start=1):
                     lines.append(f"{k}\t\t{residue_list[a]}-{residue_list[b]}")
 
@@ -334,9 +302,10 @@ def write_report(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pdb_id", help="Example: 1v4s (expects 1v4s.hinge and 1v4s.new by default)")
-    ap.add_argument("--hinge", default=None, help="Path to PDB_ID.hinge (or hinges). Default: <pdb_id>.hinge")
+    ap.add_argument("--hinge", default=None, help="Path to PDB_ID.hinge. Default: <pdb_id>.hinge")
     ap.add_argument("--new", dest="newfile", default=None, help="Path to PDB_ID.new. Default: <pdb_id>.new")
-    ap.add_argument("--min-len", type=int, default=15, help="Minimum seq_idx-gap length; shorter => remove hinge pair (default=15)")
+    ap.add_argument("--min-len", type=int, default=15,
+                    help="Minimum seq_idx-gap length; shorter => remove hinge pair (default=15)")
     ap.add_argument("--out", default=None, help="Output path. Default: <pdb_id>.rigidparts.txt")
     args = ap.parse_args()
 
