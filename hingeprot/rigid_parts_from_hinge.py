@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Create a HingeProt-like rigid-part summary from:
-  - PDB_ID.hinge  (or hinges): hinge residues + chain
-  - PDB_ID.new    : residue order (to know start/end and real ordering)
-
-Goal (updated logic):
-- Short fragments must NOT create new rigid-part boundaries.
-- If a hinge would create a segment shorter than MIN_LEN, we treat that hinge as NON-EXISTENT
-  (no sign change, no split). The would-be short segment is reported as a "Short Flexible Fragment",
-  but it is fully included inside the final rigid part.
-
-Output:
-  PDB_ID.rigidparts.txt
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -24,44 +9,34 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 
-# ---------------------- parsers ----------------------
 def _parse_pdb_like_chain_resid(line: str) -> Optional[Tuple[str, str]]:
-    """
-    Try to parse chain and resid from a PDB-like line.
-    Supports both whitespace-split and fixed-column fallback.
-    Returns (chain, resid_string) or None.
-    """
+    """Try parse (chain, resid) from ATOM/HETATM lines (split or fixed-column fallback)."""
     if not (line.startswith("ATOM") or line.startswith("HETATM")):
         return None
 
     parts = line.split()
-    chain = ""
-    resid = ""
-
-    # Common case: "ATOM  1  CA  ALA A  12  ..."
     if len(parts) >= 6:
         chain = parts[4].strip()
         resid = parts[5].strip()
-    else:
-        # Fallback to fixed columns (PDB):
-        # chain: col 22 (index 21), resid: cols 23-26 (22:26), icode: col 27 (index 26)
-        if len(line) < 27:
-            return None
-        chain = line[21].strip()
-        resnum = line[22:26].strip()
-        icode = line[26].strip()
-        resid = (resnum + icode).strip()
+        if chain and resid:
+            return chain, resid
 
-    if not chain or not resid:
+    # fixed-column fallback (PDB-ish)
+    if len(line) < 27:
         return None
-    return chain, resid
+    chain = line[21].strip()
+    resnum = line[22:26].strip()
+    icode = line[26].strip()
+    resid = (resnum + icode).strip()
+    if chain and resid:
+        return chain, resid
+    return None
 
 
 def read_residue_order_from_new(new_path: Path) -> Dict[str, List[str]]:
     """
     Reads a PDB-like .new file and returns ordered residue IDs per chain.
-    Residue ID is kept as a string (supports insertion codes like 269A).
-    Deduplicates consecutive repeats (multiple atoms per residue).
+    Deduplicates consecutive repeats.
     """
     residues_by_chain: Dict[str, List[str]] = {}
     last: Optional[Tuple[str, str]] = None
@@ -76,7 +51,6 @@ def read_residue_order_from_new(new_path: Path) -> Dict[str, List[str]]:
             key = (chain, resid)
             if key == last:
                 continue
-
             residues_by_chain.setdefault(chain, []).append(resid)
             last = key
 
@@ -87,7 +61,7 @@ def parse_hinge_file(hinge_path: Path) -> Dict[int, Dict[str, List[str]]]:
     """
     Parses a .hinge/.hinges file with sections:
       ----> crosscorrelation : 1st slowest mode
-      <idx> <resid> <chain>
+      <idx> <resid> <chain>   (or extra cols; we take last two as resid & chain)
     Returns: modes[mode_number][chain] = [resid1, resid2, ...]
     """
     modes: Dict[int, Dict[str, List[str]]] = {}
@@ -119,10 +93,8 @@ def parse_hinge_file(hinge_path: Path) -> Dict[int, Dict[str, List[str]]]:
             if len(parts) < 3:
                 continue
 
-            # More robust: take last two tokens as resid and chain
             resid_token = parts[-2].strip()
             chain = parts[-1].strip()
-
             if not resid_token or not chain:
                 continue
 
@@ -131,28 +103,21 @@ def parse_hinge_file(hinge_path: Path) -> Dict[int, Dict[str, List[str]]]:
     return modes
 
 
-# ---------------------- core logic ----------------------
 def _merge_ranges(ranges: List[Tuple[int, int]], n: int) -> List[Tuple[int, int]]:
-    """
-    Merge overlapping/adjacent index ranges and clamp to [0, n-1].
-    """
     if not ranges:
         return []
-
-    # normalize + sort
     rr = []
     for a, b in ranges:
         if a > b:
             a, b = b, a
-        rr.append((a, b))
+        a = max(0, a)
+        b = min(n - 1, b)
+        if a <= b:
+            rr.append((a, b))
     rr.sort()
 
     merged: List[Tuple[int, int]] = []
     for a, b in rr:
-        a = max(0, a)
-        b = min(n - 1, b)
-        if a > b:
-            continue
         if not merged:
             merged.append((a, b))
         else:
@@ -164,104 +129,83 @@ def _merge_ranges(ranges: List[Tuple[int, int]], n: int) -> List[Tuple[int, int]
     return merged
 
 
-def select_kept_hinges_and_short_fragments(
+def build_parts_with_left_merge(
     residue_list: List[str],
     hinge_resids: List[str],
     min_len: int,
-) -> Tuple[List[str], List[Tuple[int, int]], List[str]]:
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[str], List[str]]:
     """
-    Key behavior:
-    - Hinges that would create a segment shorter than min_len are treated as NON-EXISTENT.
-    - Rigid parts will be built only from the kept hinges.
-    - Short fragments are reported but do NOT split rigid parts.
+    Core rule you asked:
+    - Create initial parts from ALL hinge candidates.
+    - If any part length < min_len => merge that whole part into the PREVIOUS part (left).
+      (If it's the very first part, merge into the next because no previous exists.)
 
     Returns:
-      kept_hinges (resid strings)
-      short_fragments as index ranges (start_idx, end_idx) in residue_list
-      discarded_hinges (resid strings)  [informational]
+      parts_idx: final rigid parts as index ranges
+      short_frags: the merged-away short parts as index ranges (merged for readability)
+      kept_hinges: hinge residues that remain as boundaries (ends of parts except last)
+      discarded_hinges: hinge residues that were removed
     """
     n = len(residue_list)
     if n == 0:
-        return [], [], []
+        return [], [], [], []
 
     idx_map = {rid: i for i, rid in enumerate(residue_list)}
 
-    # map hinge residues to indices that exist; keep in increasing order by sequence index
-    hinge_idxs = []
-    for r in hinge_resids:
-        if r in idx_map:
-            hinge_idxs.append(idx_map[r])
-    hinge_idxs = sorted(set(hinge_idxs))
+    # map hinge residues -> indices that exist in residue_list
+    hinge_idxs = sorted({idx_map[r] for r in hinge_resids if r in idx_map})
 
-    kept_idxs: List[int] = []
-    short_ranges: List[Tuple[int, int]] = []
-    discarded_idxs: List[int] = []
-
-    prev_kept = -1
-    for idx in hinge_idxs:
-        seg_len = idx - prev_kept  # residues count in (prev_kept+1 .. idx) inclusive
-        if seg_len < min_len:
-            # Treat this hinge as NON-EXISTENT (no boundary),
-            # but record the would-be short segment (it will be included in final rigid part).
-            short_ranges.append((prev_kept + 1, idx))
-            discarded_idxs.append(idx)
-        else:
-            kept_idxs.append(idx)
-            prev_kept = idx
-
-    # Handle short tail: if last rigid part (after last kept hinge) would be too short,
-    # drop that last hinge (so tail is merged into previous rigid part).
-    # Repeat if necessary.
-    while kept_idxs:
-        last = kept_idxs[-1]
-        tail_len = (n - 1) - last  # residues count in (last+1 .. end)
-        if tail_len < min_len:
-            short_ranges.append((last + 1, n - 1))
-            discarded_idxs.append(last)
-            kept_idxs.pop()
-        else:
-            break
-
-    # Build resid outputs
-    kept_hinges = [residue_list[i] for i in kept_idxs]
-    discarded_hinges = [residue_list[i] for i in sorted(set(discarded_idxs)) if 0 <= i < n]
-
-    short_ranges = _merge_ranges(short_ranges, n)
-    return kept_hinges, short_ranges, discarded_hinges
-
-
-def build_rigid_parts_from_kept_hinges(residue_list: List[str], kept_hinges: List[str]) -> List[Tuple[int, int]]:
-    """
-    Build rigid parts as index ranges using ONLY kept hinges.
-    Hinge residue is included at the end of its left rigid part (classic convention):
-      [start..hinge1], [hinge1+1..hinge2], ..., [last+1..end]
-    """
-    idx_map = {rid: i for i, rid in enumerate(residue_list)}
-    kept_idxs = sorted({idx_map[r] for r in kept_hinges if r in idx_map})
-
+    # build initial parts using ALL hinges as boundaries (hinge belongs to left part end)
     parts: List[Tuple[int, int]] = []
     start = 0
-    for idx in kept_idxs:
-        parts.append((start, idx))
-        start = idx + 1
+    for h in hinge_idxs:
+        if start <= h:
+            parts.append((start, h))
+            start = h + 1
+    if start <= n - 1:
+        parts.append((start, n - 1))
+    if not parts:
+        parts = [(0, n - 1)]
 
-    if start <= len(residue_list) - 1:
-        parts.append((start, len(residue_list) - 1))
-    elif not parts and residue_list:
-        parts.append((0, len(residue_list) - 1))
+    def seg_len(seg: Tuple[int, int]) -> int:
+        return seg[1] - seg[0] + 1
 
-    return parts
+    short_raw: List[Tuple[int, int]] = []
+
+    # merge short parts into PREVIOUS (left)
+    i = 0
+    while i < len(parts):
+        if seg_len(parts[i]) < min_len and len(parts) > 1:
+            short_raw.append(parts[i])
+
+            if i == 0:
+                # no previous: merge into next (forced)
+                nxt = parts[1]
+                parts[1] = (parts[0][0], nxt[1])
+                parts.pop(0)
+                i = 0
+            else:
+                # merge into previous
+                prev = parts[i - 1]
+                cur = parts[i]
+                parts[i - 1] = (prev[0], cur[1])
+                parts.pop(i)
+                i = max(i - 1, 0)
+        else:
+            i += 1
+
+    short_frags = _merge_ranges(short_raw, n)
+
+    # kept hinges are the ends of parts except last part
+    kept_idx_set = {end for (_, end) in parts[:-1]}
+    kept_hinges = [residue_list[i] for i in sorted(kept_idx_set)]
+
+    discarded_idx_set = set(hinge_idxs) - kept_idx_set
+    discarded_hinges = [residue_list[i] for i in sorted(discarded_idx_set)]
+
+    return parts, short_frags, kept_hinges, discarded_hinges
 
 
-def _fragment_part_no(fragment: Tuple[int, int], parts: List[Tuple[int, int]]) -> Optional[int]:
-    a, b = fragment
-    for i, (ps, pe) in enumerate(parts, start=1):
-        if ps <= a and b <= pe:
-            return i
-    return None
-
-
-# ---------------------- report ----------------------
 def write_report(
     out_path: Path,
     pdb_id: str,
@@ -282,39 +226,30 @@ def write_report(
                 continue
 
             hinge_resids = modes[mode][chain]
-
-            kept, short_frags, discarded = select_kept_hinges_and_short_fragments(
+            parts_idx, short_frags, kept, discarded = build_parts_with_left_merge(
                 residue_list=residue_list,
                 hinge_resids=hinge_resids,
                 min_len=min_len,
             )
 
-            parts_idx = build_rigid_parts_from_kept_hinges(residue_list, kept)
-
             lines.append(f"Chain {chain}")
             lines.append("Rigid Part No\tResidues")
-            for i, (ai, bi) in enumerate(parts_idx, start=1):
-                lines.append(f"{i}\t\t{residue_list[ai]}-{residue_list[bi]}")
+            for i, (a, b) in enumerate(parts_idx, start=1):
+                lines.append(f"{i}\t\t{residue_list[a]}-{residue_list[b]}")
 
-            if kept:
-                lines.append("Hinge residues (kept): " + " ".join(kept))
-            else:
-                lines.append("Hinge residues (kept): (none)")
-
+            lines.append("Hinge residues (kept): " + (" ".join(kept) if kept else "(none)"))
             if discarded:
-                lines.append("Discarded hinges (treated as NON-hinge): " + " ".join(discarded))
+                lines.append("Discarded hinges (merged to previous rigid part): " + " ".join(discarded))
 
             if short_frags:
                 lines.append("")
-                lines.append("Short Flexible Fragments (merged into rigid parts; no boundary created):")
-                for i, (ai, bi) in enumerate(short_frags, start=1):
-                    part_no = _fragment_part_no((ai, bi), parts_idx)
-                    where = f" (in rigid part #{part_no})" if part_no is not None else ""
-                    lines.append(f"{i}\t\t{residue_list[ai]}-{residue_list[bi]}{where}")
+                lines.append("Short Flexible Fragments (fully merged into previous rigid part):")
+                for i, (a, b) in enumerate(short_frags, start=1):
+                    lines.append(f"{i}\t\t{residue_list[a]}-{residue_list[b]}")
 
-            lines.append("")  # blank line between chains
+            lines.append("")
 
-        lines.append("")      # blank line between modes
+        lines.append("")
 
     out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
@@ -324,7 +259,7 @@ def main():
     ap.add_argument("pdb_id", help="Example: 3LZG (expects 3LZG.hinge and 3LZG.new by default)")
     ap.add_argument("--hinge", default=None, help="Path to PDB_ID.hinge (or hinges). Default: <pdb_id>.hinge")
     ap.add_argument("--new", dest="newfile", default=None, help="Path to PDB_ID.new. Default: <pdb_id>.new")
-    ap.add_argument("--min-len", type=int, default=15, help="Minimum segment length to accept a hinge (default=15)")
+    ap.add_argument("--min-len", type=int, default=15, help="Minimum segment length (default=15)")
     ap.add_argument("--out", default=None, help="Output path. Default: <pdb_id>.rigidparts.txt")
     args = ap.parse_args()
 
@@ -334,7 +269,12 @@ def main():
     out_path = Path(args.out) if args.out else Path(f"{pdb_id}.rigidparts.txt")
 
     residues_by_chain = read_residue_order_from_new(new_path)
+    if not residues_by_chain:
+        raise RuntimeError(f"No residues parsed from {new_path} (is it PDB-like ATOM/HETATM format?)")
+
     modes = parse_hinge_file(hinge_path)
+    if not modes:
+        raise RuntimeError(f"No modes/hinges parsed from {hinge_path}")
 
     write_report(out_path, pdb_id, residues_by_chain, modes, min_len=args.min_len)
     print(f"[OK] Wrote: {out_path}")
