@@ -486,12 +486,12 @@ def main(workdir: str = "."):
 
     # Fortran 15: (3x,I4,1x,I4,A1,2x,A1)
     with open(wd / "hinges", "w", encoding="utf-8") as f:
-        f.write("----> crosscorrelation : 1st slowest mode\n")
+        f.write(" ----> crosscorrelation : 1st slowest mode\n")
         for h in hinge1:
             idx = h - 1
             f.write(f"   {h:4d} {cano[idx]:4d}{resex[idx]:1s}  {chtyp[idx]:1s}\n")
 
-        f.write("----> crosscorrelation : 2nd slowest mode\n")
+        f.write(" ----> crosscorrelation : 2nd slowest mode\n")
         for h in hinge2:
             idx = h - 1
             f.write(f"   {h:4d} {cano[idx]:4d}{resex[idx]:1s}  {chtyp[idx]:1s}\n")
