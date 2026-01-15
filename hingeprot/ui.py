@@ -25,14 +25,18 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     output.enable_custom_widget_manager()
 
     HINGEPROT_DIR = os.path.dirname(os.path.abspath(__file__))
-    READ_PY          = os.path.join(HINGEPROT_DIR, "read.py")
-    GNM_PY           = os.path.join(HINGEPROT_DIR, "gnm.py")
-    ANM2_PY          = os.path.join(HINGEPROT_DIR, "anm2.py")
-    USEBLZ_PY        = os.path.join(HINGEPROT_DIR, "useblz.py")
-    ANM3_PY          = os.path.join(HINGEPROT_DIR, "anm3.py")
-    EXTRACT_PY       = os.path.join(HINGEPROT_DIR, "extract.py")
-    COOR2PDB_PY      = os.path.join(HINGEPROT_DIR, "coor2pdb.py")
-    RIGIDPARTS_PY    = os.path.join(HINGEPROT_DIR, "rigid_parts_from_hinge.py")
+
+    # Python steps we still use
+    READ_PY   = os.path.join(HINGEPROT_DIR, "read.py")
+    GNM_PY    = os.path.join(HINGEPROT_DIR, "gnm.py")
+    ANM2_PY   = os.path.join(HINGEPROT_DIR, "anm2.py")
+    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")
+
+    # --- compiled Fortran part2 (replaces: anm3.py + extract.py + coor2pdb.py) ---
+    PART2_BIN = os.path.join(HINGEPROT_DIR, "part2")
+
+    # Rigid parts report (optional)
+    RIGIDPARTS_PY = os.path.join(HINGEPROT_DIR, "rigid_parts_from_hinge.py")
 
     # --- compiled binaries (preferred) ---
     PROCESSHINGES_BIN = os.path.join(HINGEPROT_DIR, "processHinges")
@@ -342,6 +346,34 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         except Exception:
             pass
 
+    # --- fix for 'Invalid line in site file: ... A' ---
+    def _clean_site_file_two_cols(run_dir: str, in_rel: str, out_rel: str) -> str:
+        """
+        processHinges binary expects 2 integers per line.
+        If hinge file contains extra tokens (e.g., chain letters), strip to: "start end".
+        """
+        in_path = os.path.join(run_dir, in_rel)
+        out_path = os.path.join(run_dir, out_rel)
+        kept = 0
+        with open(in_path, "r", encoding="utf-8", errors="ignore") as fin, \
+             open(out_path, "w", encoding="utf-8") as fout:
+            for line in fin:
+                s = line.strip()
+                if not s or s.startswith("#") or s.startswith(";"):
+                    continue
+                parts = s.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    a = int(parts[0]); b = int(parts[1])
+                except Exception:
+                    continue
+                fout.write(f"{a} {b}\n")
+                kept += 1
+        if kept == 0:
+            raise RuntimeError(f"Cleaned hinge file empty: {out_rel}")
+        return out_rel
+
     # ---------- UI ----------
     css = W.HTML(r"""
     <style>
@@ -438,7 +470,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     chain_row = W.HBox([chains_label, chains_wrap], layout=W.Layout(align_items="center", gap="12px", width="100%"))
 
     gnm_row, get_gnm_cut = _list_or_custom_float(
-        "GNM cutoff (Å):", options=[7, 8, 9, 10, 11, 12, 13, 20], default_value=10.0, minv=1.0, maxv=100.0
+        "GNM cutoff (Å):", options=[7, 8, 9 progress=10, 11, 12, 13, 20], default_value=10.0, minv=1.0, maxv=100.0
     )
     anm_row, get_anm_cut = _list_or_custom_float(
         "ANM cutoff (Å):", options=[10, 13, 15, 18, 20, 23, 36], default_value=18.0, minv=1.0, maxv=100.0
@@ -675,17 +707,20 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not state["pdb_path"] or not os.path.exists(state["pdb_path"]):
                 raise RuntimeError("Please click 'Load / Detect Chains' first.")
 
+            # check python scripts
             for p, name in [
                 (READ_PY, "read.py"),
                 (GNM_PY, "gnm.py"),
                 (ANM2_PY, "anm2.py"),
                 (USEBLZ_PY, "useblz.py"),
-                (ANM3_PY, "anm3.py"),
-                (EXTRACT_PY, "extract.py"),
-                (COOR2PDB_PY, "coor2pdb.py"),
             ]:
                 if not os.path.exists(p):
                     raise RuntimeError(f"{name} not found at: {p}")
+
+            # check binaries
+            if not os.path.exists(PART2_BIN):
+                raise RuntimeError(f"part2 (binary) not found at: {PART2_BIN}")
+            _chmod_x(PART2_BIN)
 
             detected = state.get("detected_chains", [])
             if not detected:
@@ -706,7 +741,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             RESCALE_DEFAULT = 1.0
 
-            progress.max = 11
+            # steps: params, preprocess, read, gnm, anm2, useblz, part2, rename/zips, processHinges
+            progress.max = 9
             progress.value = 0
             progress.bar_style = "info"
 
@@ -795,31 +831,18 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
                 raise RuntimeError("useblz.py did not produce upperhessian.vwmatrixd (missing/empty).")
 
-            # 7) anm3.py
-            _run(["python3", ANM3_PY, "--alpha", "alpha.cor", "--eig", "upperhessian.vwmatrixd", "--outdir", "."], cwd=run_dir, title="anm3.py")
+            # 7) part2 (compiled Fortran)  -> produces: newcoordinat.mds, hinges, sortedeigen, eigenanm, gnm1/2anmvector, 1..36coor
+            _ensure_libg2c_runtime(run_dir)
+            _run([PART2_BIN], cwd=run_dir, title="part2 (binary)", allow_fail=False)
             progress.value += 1
 
-            _require_files(run_dir, ["newcoordinat.mds"], "anm3.py postcheck")
-            _require_files(run_dir, [f"{k}coor" for k in range(1, 11)], "anm3.py postcheck")
+            _require_files(run_dir, ["newcoordinat.mds"], "part2 postcheck")
+            _require_files(run_dir, ["hinges"], "part2 postcheck")
+            _require_files(run_dir, ["sortedeigen", "eigenanm"], "part2 postcheck")
+            _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "part2 postcheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "part2 postcheck")
 
-            # 8) extract.py
-            _require_files(run_dir, ["coordinates", "alpha.cor", "slowmodes"], "extract.py precheck")
-            _require_files(run_dir, ["newcoordinat.mds"], "extract.py precheck")
-            _run(["python3", EXTRACT_PY], cwd=run_dir, title="extract.py")
-            progress.value += 1
-
-            hinges_path = os.path.join(run_dir, "hinges")
-            if not os.path.exists(hinges_path) or os.path.getsize(hinges_path) == 0:
-                raise RuntimeError("extract.py did not produce hinges (missing/empty).")
-
-            # 9) coor2pdb.py
-            _require_files(run_dir, ["pdb"], "coor2pdb.py precheck")
-            _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "coor2pdb.py precheck")
-            _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "coor2pdb.py precheck")
-            _run(["python3", COOR2PDB_PY], cwd=run_dir, title="coor2pdb.py")
-            progress.value += 1
-
-            # 10) rename + zips
+            # 8) rename + zips
             rename_map = [
                 ("gnm1anmvector",    f"{tag}.1vector"),
                 ("gnm2anmvector",    f"{tag}.2vector"),
@@ -848,34 +871,26 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             else:
                 _show_log("WARNING: rigid_parts_from_hinge.py not found; skipping rigid parts report.")
 
-            # Optional zip of *anm.pdb (kept)
-            anm_pdbs = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "*anm.pdb")))]
-            if anm_pdbs:
-                _zip_make("anm136.zip", anm_pdbs)
-
             gnm_cross_zip = _make_gnm_crosscor_zip(run_dir, tag)
             progress.value += 1
 
-            # 11) processHinges (COMPILED BINARY) + outputs you want
+            # 9) processHinges (COMPILED BINARY) + outputs you want
             loop_thr = "15"
             clust_thr = "14.0"
 
-            # Perl akışı: processHinges her zaman TAG.hinge ile çalışır (rigidparts değil)
+            # Perl flow: processHinges always uses TAG.hinge (not rigidparts)
             hinge_arg = f"{tag}.hinge"
             new_arg   = f"{tag}.new"
 
-            # candidates for binary output names
+            # Clean hinge file to 2-int format (fixes: "Invalid line in site file: ... A")
+            if os.path.exists(os.path.join(run_dir, hinge_arg)):
+                hinge_arg = _clean_site_file_two_cols(run_dir, hinge_arg, f"{tag}.hinge.clean")
+
             def _moved1_candidates():
-                return [
-                    f"{tag}.new.moved1.pdb", f"{tag}.moved1.pdb",
-                    "new.moved1.pdb", "moved1.pdb",
-                ]
+                return [f"{tag}.new.moved1.pdb", f"{tag}.moved1.pdb", "new.moved1.pdb", "moved1.pdb"]
 
             def _moved2_candidates():
-                return [
-                    f"{tag}.new.moved2.pdb", f"{tag}.moved2.pdb",
-                    "new.moved2.pdb", "moved2.pdb",
-                ]
+                return [f"{tag}.new.moved2.pdb", f"{tag}.moved2.pdb", "new.moved2.pdb", "moved2.pdb"]
 
             def _find_existing(cands):
                 return next((c for c in cands if os.path.exists(os.path.join(run_dir, c))), None)
@@ -886,14 +901,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 _chmod_x(path)
 
             if os.path.exists(os.path.join(run_dir, new_arg)) and os.path.exists(os.path.join(run_dir, hinge_arg)):
-                # If binary exists, use it (requested)
-                if os.path.exists(PROCESSHINGES_BIN):
-                    _require_bin(PROCESSHINGES_BIN, "processHinges (binary)")
-                    _ensure_libg2c_runtime(run_dir)
-                else:
-                    raise RuntimeError(f"processHinges binary not found at: {PROCESSHINGES_BIN}")
-
-                # splitter is needed for final step (Perl akışı)
+                _require_bin(PROCESSHINGES_BIN, "processHinges (binary)")
+                _ensure_libg2c_runtime(run_dir)
                 _require_bin(SPLITTER_BIN, "splitter (binary)")
 
                 def _run_processhinges_bin(v1: str, v2: str):
@@ -920,7 +929,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     _safe_rename(c1, f"anment{i}.pdb")
                     _safe_rename(c2, f"anment{i+1}.pdb")
 
-                # Final call with 1vector/2vector -> loops + mode ent + splitter + mode1.ent/mode2.ent
+                # Final call with 1vector/2vector -> splitter -> mode1.ent/mode2.ent
                 v1g = f"{tag}.1vector"
                 v2g = f"{tag}.2vector"
                 if os.path.exists(os.path.join(run_dir, v1g)) and os.path.exists(os.path.join(run_dir, v2g)):
@@ -931,7 +940,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     if not c1 or not c2:
                         raise RuntimeError("Final processHinges (1vector/2vector) did not produce moved1/moved2.")
 
-                    # Perl: rename("$pdbCode.new.loops", "$pdb.loops");
+                    # rename loops
                     loops_src = os.path.join(run_dir, f"{tag}.new.loops")
                     loops_dst = os.path.join(run_dir, f"{tag}.loops")
                     if os.path.exists(loops_src):
@@ -942,7 +951,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         except Exception as e:
                             _show_log(f"WARNING: loop rename failed: {e}")
 
-                    # Perl: copy moved -> modeent1/modeent2 ; run splitter ; unlink modeent*
                     shutil.copyfile(os.path.join(run_dir, c1), os.path.join(run_dir, "modeent1"))
                     shutil.copyfile(os.path.join(run_dir, c2), os.path.join(run_dir, "modeent2"))
 
@@ -954,19 +962,14 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         except Exception:
                             pass
 
-                    # Perl: rename moved -> $pdbCode.mode1.ent / mode2.ent
-                    # UI wants mode1.ent/mode2.ent for download -> create those
-                    # (keep tag.mode1.ent, tag.mode2.ent too)
                     tag_mode1 = os.path.join(run_dir, f"{tag}.mode1.ent")
                     tag_mode2 = os.path.join(run_dir, f"{tag}.mode2.ent")
 
-                    # moved files might have changed names; locate again
                     c1_after = _find_existing(_moved1_candidates())
                     c2_after = _find_existing(_moved2_candidates())
                     if not c1_after or not c2_after:
                         raise RuntimeError("After splitter, moved1/moved2 not found to rename into mode ent.")
 
-                    # move to tag.mode*.ent
                     try:
                         if os.path.exists(tag_mode1):
                             os.remove(tag_mode1)
@@ -977,20 +980,16 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     except Exception as e:
                         raise RuntimeError(f"Renaming moved -> tag.mode*.ent failed: {e}")
 
-                    # also make generic mode1.ent/mode2.ent for downloads
                     shutil.copyfile(tag_mode1, os.path.join(run_dir, "mode1.ent"))
                     shutil.copyfile(tag_mode2, os.path.join(run_dir, "mode2.ent"))
-
                 else:
                     _show_log("WARNING: Missing TAG.1vector / TAG.2vector; skipping final mode1/mode2 production.")
 
-                # Perl: `zip panm136.zip anment*`
                 anment_files = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "anment*.pdb")))]
                 if anment_files:
                     _zip_make("panm136.zip", anment_files)
                 else:
                     _show_log("WARNING: No anment*.pdb found; panm136.zip not created.")
-
             else:
                 _show_log("WARNING: Missing TAG.new or TAG.hinge; skipping processHinges binary stage.")
 
