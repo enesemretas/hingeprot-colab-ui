@@ -470,7 +470,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     chain_row = W.HBox([chains_label, chains_wrap], layout=W.Layout(align_items="center", gap="12px", width="100%"))
 
     gnm_row, get_gnm_cut = _list_or_custom_float(
-        "GNM cutoff (Å):", options=[7, 8, 9 progress=10, 11, 12, 13, 20], default_value=10.0, minv=1.0, maxv=100.0
+        "GNM cutoff (Å):", options=[7, 8, 9, 10, 11, 12, 13, 20], default_value=10.0, minv=1.0, maxv=100.0
     )
     anm_row, get_anm_cut = _list_or_custom_float(
         "ANM cutoff (Å):", options=[10, 13, 15, 18, 20, 23, 36], default_value=18.0, minv=1.0, maxv=100.0
