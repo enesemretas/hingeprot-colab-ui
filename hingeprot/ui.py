@@ -25,15 +25,15 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
     output.enable_custom_widget_manager()
 
     HINGEPROT_DIR = os.path.dirname(os.path.abspath(__file__))
+    HOME = HINGEPROT_DIR  # user's "$home" in: $home/part1 ... ; $home/useblz ; $home/part2
 
-    # Python steps we still use
-    READ_PY   = os.path.join(HINGEPROT_DIR, "read.py")
-    GNM_PY    = os.path.join(HINGEPROT_DIR, "gnm.py")
-    ANM2_PY   = os.path.join(HINGEPROT_DIR, "anm2.py")
-    USEBLZ_PY = os.path.join(HINGEPROT_DIR, "useblz.py")
+    # Python step we still use
+    READ_PY = os.path.join(HINGEPROT_DIR, "read.py")
 
-    # --- compiled Fortran part2 (replaces: anm3.py + extract.py + coor2pdb.py) ---
-    PART2_BIN = os.path.join(HINGEPROT_DIR, "part2")
+    # --- compiled Fortran binaries (new flow) ---
+    PART1_BIN  = os.path.join(HINGEPROT_DIR, "part1")   # replaces: gnm.py + anm2.py
+    USEBLZ_BIN = os.path.join(HINGEPROT_DIR, "useblz")  # replaces: useblz.py
+    PART2_BIN  = os.path.join(HINGEPROT_DIR, "part2")   # continues: produces hinges/newcoordinat/etc.
 
     # Rigid parts report (optional)
     RIGIDPARTS_PY = os.path.join(HINGEPROT_DIR, "rigid_parts_from_hinge.py")
@@ -71,10 +71,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         chains.add(ch)
         return sorted(chains)
 
-    def _write_text(path: str, text: str):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(text).strip() + "\n")
-
     def _run(cmd: list[str], cwd: str, title: str, allow_fail: bool = False):
         _show_log(f"Running: {' '.join(cmd)}")
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -97,6 +93,22 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
         missing = [rp for rp in relpaths if not os.path.exists(os.path.join(run_dir, rp))]
         if missing:
             raise RuntimeError(f"{step_name}: missing required files: {', '.join(missing)}")
+
+    def _require_nonempty(run_dir: str, relpaths: list[str], step_name: str):
+        missing = []
+        for rp in relpaths:
+            fp = os.path.join(run_dir, rp)
+            if (not os.path.exists(fp)) or os.path.getsize(fp) <= 0:
+                missing.append(rp)
+        if missing:
+            raise RuntimeError(f"{step_name}: missing/empty required files: {', '.join(missing)}")
+
+    def _require_any_nonempty(run_dir: str, candidates: list[str], step_name: str) -> str:
+        for rp in candidates:
+            fp = os.path.join(run_dir, rp)
+            if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                return rp
+        raise RuntimeError(f"{step_name}: none of these files exist & non-empty: {', '.join(candidates)}")
 
     def _preprocess_pdb(
         pdb_in: str,
@@ -345,6 +357,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 os.chmod(path, st | 0o111)
         except Exception:
             pass
+
+    def _fmt_num(v: float) -> str:
+        # avoids "10.0" -> "10" while keeping custom floats like "10.5"
+        return f"{float(v):g}"
 
     # --- fix for 'Invalid line in site file: ... A' ---
     def _clean_site_file_two_cols(run_dir: str, in_rel: str, out_rel: str) -> str:
@@ -707,20 +723,15 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not state["pdb_path"] or not os.path.exists(state["pdb_path"]):
                 raise RuntimeError("Please click 'Load / Detect Chains' first.")
 
-            # check python scripts
-            for p, name in [
-                (READ_PY, "read.py"),
-                (GNM_PY, "gnm.py"),
-                (ANM2_PY, "anm2.py"),
-                (USEBLZ_PY, "useblz.py"),
-            ]:
-                if not os.path.exists(p):
-                    raise RuntimeError(f"{name} not found at: {p}")
+            # check python script
+            if not os.path.exists(READ_PY):
+                raise RuntimeError(f"read.py not found at: {READ_PY}")
 
-            # check binaries
-            if not os.path.exists(PART2_BIN):
-                raise RuntimeError(f"part2 (binary) not found at: {PART2_BIN}")
-            _chmod_x(PART2_BIN)
+            # check binaries (home/part1 ; home/useblz ; home/part2)
+            for p, nm in [(PART1_BIN, "part1"), (USEBLZ_BIN, "useblz"), (PART2_BIN, "part2")]:
+                if not os.path.exists(p):
+                    raise RuntimeError(f"{nm} (binary) not found at: {p}")
+                _chmod_x(p)
 
             detected = state.get("detected_chains", [])
             if not detected:
@@ -738,11 +749,11 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             gnm_val = float(get_gnm_cut())
             anm_val = float(get_anm_cut())
+            gnm_arg = _fmt_num(gnm_val)
+            anm_arg = _fmt_num(anm_val)
 
-            RESCALE_DEFAULT = 1.0
-
-            # steps: params, preprocess, read, gnm, anm2, useblz, part2, rename/zips, processHinges
-            progress.max = 9
+            # steps: preprocess, read, part1, useblz, part2, rename/zips/report, processHinges
+            progress.max = 7
             progress.value = 0
             progress.bar_style = "info"
 
@@ -779,13 +790,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     for rf in files_ok:
                         z.write(os.path.join(run_dir, rf), arcname=rf)
 
-            # 1) params
-            _write_text(os.path.join(run_dir, "gnmcutoff"), gnm_val)
-            _write_text(os.path.join(run_dir, "anmcutoff"), anm_val)
-            _write_text(os.path.join(run_dir, "rescale"), RESCALE_DEFAULT)
-            progress.value += 1
-
-            # 2) preprocess -> pdb
+            # 1) preprocess -> pdb
             pdb_out = os.path.join(run_dir, "pdb")
             _preprocess_pdb(
                 pdb_in=state["pdb_path"],
@@ -799,55 +804,62 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             if not os.path.exists(pdb_out) or os.path.getsize(pdb_out) == 0:
                 raise RuntimeError("Preprocess produced empty 'pdb'. Check chain selection / filters.")
 
-            # 3) read.py
+            # 2) read.py -> alpha.cor + coordinates
             _run(["python3", READ_PY, "pdb", "alpha.cor", "coordinates"], cwd=run_dir, title="read.py")
+            _require_nonempty(run_dir, ["alpha.cor", "coordinates"], "read.py postcheck")
             progress.value += 1
 
-            # 4) gnm.py
-            _run(
-                ["python3", GNM_PY, "--coords", "coordinates", "--cutoff", "gnmcutoff", "--nslow", "10"],
-                cwd=run_dir,
-                title="gnm.py",
-            )
-            progress.value += 1
-
-            # 5) anm2.py
-            _run(
-                ["python3", ANM2_PY, "--alpha", "alpha.cor", "--cutoff", "anmcutoff", "--out", "upperhessian"],
-                cwd=run_dir,
-                title="anm2.py",
-            )
-            progress.value += 1
-
-            upper_path = os.path.join(run_dir, "upperhessian")
-            if not os.path.exists(upper_path) or os.path.getsize(upper_path) == 0:
-                raise RuntimeError("upperhessian is missing or empty; cannot solve eigenproblem.")
-
-            # 6) useblz.py
-            _run(["python3", USEBLZ_PY, "upperhessian", "--out", "upperhessian.vwmatrixd"], cwd=run_dir, title="useblz.py")
-            progress.value += 1
-
-            out_vw = os.path.join(run_dir, "upperhessian.vwmatrixd")
-            if not os.path.exists(out_vw) or os.path.getsize(out_vw) == 0:
-                raise RuntimeError("useblz.py did not produce upperhessian.vwmatrixd (missing/empty).")
-
-            # 7) part2 (compiled Fortran)  -> produces: newcoordinat.mds, hinges, sortedeigen, eigenanm, gnm1/2anmvector, 1..36coor
+            # Ensure libg2c once before old binaries
             _ensure_libg2c_runtime(run_dir)
-            _run([PART2_BIN], cwd=run_dir, title="part2 (binary)", allow_fail=False)
+
+            # 3) part1 (binary): $home/part1 gnm anm
+            # user requested: $home/part1 10 18 (these are gnm & anm cutoffs)
+            _show_log(f"HOME={HOME}")
+            _run([PART1_BIN, gnm_arg, anm_arg], cwd=run_dir, title="part1 (binary)", allow_fail=False)
+
+            # part1 should create at least upperhessian + slowmodes + (often) fort.44
+            # (fort.44 is later read by part2 in your error output)
+            _require_any_nonempty(run_dir, ["upperhessian", "upperhessian.dat", "upperhessian.bin"], "part1 postcheck (upperhessian)")
+            _require_any_nonempty(run_dir, ["slowmodes", "slowmodes.dat"], "part1 postcheck (slowmodes)")
+            # fort.44 might be required by part2; check existence early
+            _require_any_nonempty(run_dir, ["fort.44", "fort.4", "fort44"], "part1 postcheck (fort.44)")
             progress.value += 1
 
-            _require_files(run_dir, ["newcoordinat.mds"], "part2 postcheck")
-            _require_files(run_dir, ["hinges"], "part2 postcheck")
-            _require_files(run_dir, ["sortedeigen", "eigenanm"], "part2 postcheck")
-            _require_files(run_dir, ["gnm1anmvector", "gnm2anmvector"], "part2 postcheck")
-            _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "part2 postcheck")
+            # 4) useblz (binary): $home/useblz  (no args)
+            _run([USEBLZ_BIN], cwd=run_dir, title="useblz (binary)", allow_fail=False)
 
-            # 8) rename + zips
+            # normalize output name if needed
+            if not (os.path.exists(os.path.join(run_dir, "upperhessian.vwmatrixd")) and os.path.getsize(os.path.join(run_dir, "upperhessian.vwmatrixd")) > 0):
+                alt = None
+                for cand in ["upperhessian.vwmatrix", "upperhessian.vwmatrixD", "vwmatrixd", "upperhessian.vw", "upperhessian.eig", "upperhessian.vwmatrix.dat"]:
+                    fp = os.path.join(run_dir, cand)
+                    if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                        alt = cand
+                        break
+                if alt:
+                    shutil.copyfile(os.path.join(run_dir, alt), os.path.join(run_dir, "upperhessian.vwmatrixd"))
+                _require_nonempty(run_dir, ["upperhessian.vwmatrixd"], "useblz postcheck")
+            progress.value += 1
+
+            # 5) part2 (binary): $home/part2
+            _run([PART2_BIN], cwd=run_dir, title="part2 (binary)", allow_fail=False)
+
+            # part2 should produce: newcoordinat.mds, hinges, gnm1/2anmvector, 1..36coor (as earlier)
+            _require_nonempty(run_dir, ["newcoordinat.mds"], "part2 postcheck")
+            _require_nonempty(run_dir, ["hinges"], "part2 postcheck")
+            _require_nonempty(run_dir, ["gnm1anmvector", "gnm2anmvector"], "part2 postcheck")
+            _require_files(run_dir, [f"{k}coor" for k in range(1, 37)], "part2 postcheck (coor vectors)")
+            progress.value += 1
+
+            # 6) rename + optional report + zips
             rename_map = [
                 ("gnm1anmvector",    f"{tag}.1vector"),
                 ("gnm2anmvector",    f"{tag}.2vector"),
                 ("hinges",           f"{tag}.hinge"),
                 ("newcoordinat.mds", f"{tag}.new"),
+            ]
+            # optional (may be produced by part1 or part2; safe_rename will ignore if absent)
+            rename_map += [
                 ("sortedeigen",      f"{tag}.eigengnm"),
                 ("eigenanm",         f"{tag}.eigenanm"),
             ]
@@ -858,27 +870,29 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 _safe_rename(src, dst)
 
             if os.path.exists(RIGIDPARTS_PY):
-                _run(
-                    ["python3", RIGIDPARTS_PY, tag,
-                     "--hinge", f"{tag}.hinge",
-                     "--new", f"{tag}.new",
-                     "--min-len", "15",
-                     "--out", f"{tag}.rigidparts.txt"],
-                    cwd=run_dir,
-                    title="rigid_parts_from_hinge.py",
-                    allow_fail=False
-                )
+                try:
+                    _run(
+                        ["python3", RIGIDPARTS_PY, tag,
+                         "--hinge", f"{tag}.hinge",
+                         "--new", f"{tag}.new",
+                         "--min-len", "15",
+                         "--out", f"{tag}.rigidparts.txt"],
+                        cwd=run_dir,
+                        title="rigid_parts_from_hinge.py",
+                        allow_fail=False
+                    )
+                except Exception as e:
+                    _show_log(f"WARNING: rigid parts report failed: {e}")
             else:
                 _show_log("WARNING: rigid_parts_from_hinge.py not found; skipping rigid parts report.")
 
             gnm_cross_zip = _make_gnm_crosscor_zip(run_dir, tag)
             progress.value += 1
 
-            # 9) processHinges (COMPILED BINARY) + outputs you want
+            # 7) processHinges (binary) + outputs
             loop_thr = "15"
             clust_thr = "14.0"
 
-            # Perl flow: processHinges always uses TAG.hinge (not rigidparts)
             hinge_arg = f"{tag}.hinge"
             new_arg   = f"{tag}.new"
 
@@ -902,7 +916,6 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
             if os.path.exists(os.path.join(run_dir, new_arg)) and os.path.exists(os.path.join(run_dir, hinge_arg)):
                 _require_bin(PROCESSHINGES_BIN, "processHinges (binary)")
-                _ensure_libg2c_runtime(run_dir)
                 _require_bin(SPLITTER_BIN, "splitter (binary)")
 
                 def _run_processhinges_bin(v1: str, v2: str):
@@ -917,7 +930,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 for i in range(1, 37, 2):
                     v1 = f"{tag}.anm{i}vector"
                     v2 = f"{tag}.anm{i+1}vector"
-                    if not (os.path.exists(os.path.join(run_dir, v1)) and os.path.exists(os.path.join(run_dir, v2))):
+                    if not (os.path.exists(os.path.join(run_dir, v1)) and os.path.getsize(os.path.join(run_dir, v1)) > 0 and
+                            os.path.exists(os.path.join(run_dir, v2)) and os.path.getsize(os.path.join(run_dir, v2)) > 0):
                         continue
 
                     _run_processhinges_bin(v1, v2)
@@ -932,7 +946,9 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 # Final call with 1vector/2vector -> splitter -> mode1.ent/mode2.ent
                 v1g = f"{tag}.1vector"
                 v2g = f"{tag}.2vector"
-                if os.path.exists(os.path.join(run_dir, v1g)) and os.path.exists(os.path.join(run_dir, v2g)):
+                if os.path.exists(os.path.join(run_dir, v1g)) and os.path.getsize(os.path.join(run_dir, v1g)) > 0 and \
+                   os.path.exists(os.path.join(run_dir, v2g)) and os.path.getsize(os.path.join(run_dir, v2g)) > 0:
+
                     _run_processhinges_bin(v1g, v2g)
 
                     c1 = _find_existing(_moved1_candidates())
@@ -940,7 +956,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                     if not c1 or not c2:
                         raise RuntimeError("Final processHinges (1vector/2vector) did not produce moved1/moved2.")
 
-                    # rename loops
+                    # rename loops if present
                     loops_src = os.path.join(run_dir, f"{tag}.new.loops")
                     loops_dst = os.path.join(run_dir, f"{tag}.loops")
                     if os.path.exists(loops_src):
@@ -951,6 +967,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                         except Exception as e:
                             _show_log(f"WARNING: loop rename failed: {e}")
 
+                    # splitter flow
                     shutil.copyfile(os.path.join(run_dir, c1), os.path.join(run_dir, "modeent1"))
                     shutil.copyfile(os.path.join(run_dir, c2), os.path.join(run_dir, "modeent2"))
 
@@ -985,6 +1002,7 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
                 else:
                     _show_log("WARNING: Missing TAG.1vector / TAG.2vector; skipping final mode1/mode2 production.")
 
+                # create panm136.zip from anment*.pdb
                 anment_files = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(run_dir, "anment*.pdb")))]
                 if anment_files:
                     _zip_make("panm136.zip", anment_files)
@@ -1016,7 +1034,8 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
             _add_dl("Download ANM (panm136.zip)", "panm136.zip")
             _add_dl("Download mode1.ent", "mode1.ent")
             _add_dl("Download mode2.ent", "mode2.ent")
-            _add_dl("Download rigid parts report", f"{tag}.rigidparts.txt")
+            if os.path.exists(os.path.join(run_dir, f"{tag}.rigidparts.txt")):
+                _add_dl("Download rigid parts report", f"{tag}.rigidparts.txt")
             if gnm_cross_zip:
                 _add_dl("Download GNM_CROSSCOR.zip", gnm_cross_zip)
 
@@ -1027,7 +1046,10 @@ def launch(runs_root: str = "/content/hingeprot_runs"):
 
         except Exception as e:
             progress.bar_style = "danger"
-            _set_hinge_text(f"ERROR: {e}\n\n(If you want debug logs back, tell me and I’ll show log_out.)")
+            _set_hinge_text(
+                f"ERROR: {e}\n\n"
+                f"(If you want debug logs back, tell me and I’ll show log_out.)"
+            )
             downloads_wrap.children = ()
 
     def on_clear_clicked(_):
